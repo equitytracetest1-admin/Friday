@@ -1,0 +1,15 @@
+# STT
+groq
+
+# LLM
+google-generativeai
+
+# TTS (local, no API key)
+kokoro-onnx
+
+# Audio I/O
+sounddevice
+numpy
+
+# Env
+python-dotenv
