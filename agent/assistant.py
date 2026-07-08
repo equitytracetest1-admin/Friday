@@ -1,13 +1,13 @@
 """
-agent/assistant.py — Friday's core reasoning loop (Gemini 2.5 Flash)
+agent/assistant.py — Friday's core reasoning loop
+LLM: Groq (primary: llama-3.3-70b-versatile, backup: llama-3.1-8b-instant)
 """
 
 import os
 import re
 import json
 
-from google import genai
-from google.genai import types
+from groq import Groq, RateLimitError
 from dotenv import load_dotenv
 
 from memory.vault  import Vault
@@ -15,9 +15,49 @@ from memory.recall import recent_history
 
 load_dotenv(".env.local")
 
-_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-MODEL   = "gemini-2.5-flash"
+# ── Models ────────────────────────────────────────────────────────────────────
+PRIMARY_MODEL = "llama-3.3-70b-versatile"   # 1,000 req/day  — best reasoning
+BACKUP_MODEL  = "llama-3.1-8b-instant"      # 14,400 req/day — fast fallback
 
+_client = Groq(api_key=os.environ["GROQ_API_KEY"])
+
+# Track which model is active this session
+_active_model  = PRIMARY_MODEL
+_primary_exhausted = False
+
+# ── Notification ──────────────────────────────────────────────────────────────
+def _notify(title: str, message: str) -> None:
+    """Send a Windows toast notification (silent fallback to print)."""
+    try:
+        from plyer import notification
+        notification.notify(
+            title=title,
+            message=message,
+            app_name="Friday",
+            timeout=6,
+        )
+    except Exception:
+        pass
+    print(f"\n🔔  [{title}] {message}\n")
+
+
+def _get_model() -> str:
+    return _active_model
+
+
+def _switch_to_backup() -> None:
+    global _active_model, _primary_exhausted
+    if not _primary_exhausted:
+        _primary_exhausted = True
+        _active_model = BACKUP_MODEL
+        _notify(
+            "Friday — Model Limit Reached",
+            f"Primary model ({PRIMARY_MODEL}) quota exhausted.\n"
+            f"Switching to backup: {BACKUP_MODEL}.",
+        )
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
 _SYSTEM_BASE = """\
 You are Friday, a fast and helpful voice AI assistant.
 Your replies will be spoken aloud, so:
@@ -51,22 +91,19 @@ def _skills_block() -> str:
         return "  (none registered)"
     return "\n".join(f"  - {name}: {meta['description']}" for name, meta in skills.items())
 
-# Matches a JSON object on its own line at the start of the response
+
+# ── Skill invocation ──────────────────────────────────────────────────────────
 _SKILL_RE = re.compile(r'^\s*(\{[^\n]+\})\s*\n?(.*)', re.DOTALL)
 
 def _try_invoke_skill(raw: str) -> tuple[str | None, str]:
-    """
-    If response starts with a JSON skill block, execute it.
-    Returns (skill_result, remaining_spoken_text).
-    """
     match = _SKILL_RE.match(raw)
     if not match:
         return None, raw
 
     try:
-        data = json.loads(match.group(1))
-        name = data.get("skill", "")
-        args = data.get("args", {})
+        data  = json.loads(match.group(1))
+        name  = data.get("skill", "")
+        args  = data.get("args", {})
         skills = _load_skills()
 
         if name in skills:
@@ -80,73 +117,97 @@ def _try_invoke_skill(raw: str) -> tuple[str | None, str]:
     return None, raw
 
 
+# ── Groq chat wrapper ─────────────────────────────────────────────────────────
+def _chat(messages: list[dict], system: str) -> str:
+    """
+    Call Groq with automatic fallback from primary → backup model.
+    Raises RuntimeError if both models are exhausted.
+    """
+    global _active_model
+
+    for attempt in range(2):  # at most 2 attempts: primary then backup
+        model = _get_model()
+        try:
+            response = _client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system}] + messages,
+            )
+            return response.choices[0].message.content.strip()
+
+        except RateLimitError:
+            if model == PRIMARY_MODEL:
+                _switch_to_backup()
+                continue  # retry with backup
+            else:
+                # Backup also exhausted
+                _notify(
+                    "Friday — All Models Exhausted",
+                    f"Backup model ({BACKUP_MODEL}) quota also exhausted.\n"
+                    "Please wait until quota resets or add billing.",
+                )
+                raise RuntimeError("Both primary and backup models are rate-limited.")
+
+    raise RuntimeError("LLM call failed after fallback.")
+
+
+# ── History helpers ───────────────────────────────────────────────────────────
+def _to_groq(history: list[dict]) -> list[dict]:
+    """Ensure history is in Groq's plain dict format."""
+    result = []
+    for entry in history:
+        role  = entry.get("role", "user")
+        parts = entry.get("parts", [])
+        # Handle both Groq dicts and Gemini Content objects
+        if isinstance(parts, list):
+            text = " ".join(
+                p if isinstance(p, str) else getattr(p, "text", str(p))
+                for p in parts
+            )
+        else:
+            text = str(parts)
+        result.append({"role": role, "content": text})
+    return result
+
+
+# ── Assistant class ───────────────────────────────────────────────────────────
 class Assistant:
     def __init__(self):
         self._system  = _build_system_prompt()
-        self._history : list[types.Content] = []
+        self._history : list[dict] = []   # Groq format: [{"role":..,"content":..}]
 
     def start_session(self, vault: Vault) -> None:
         raw_history = recent_history(vault)
-        self._history = [
-            types.Content(
-                role=entry["role"],
-                parts=[types.Part(text=p) for p in entry["parts"]],
-            )
-            for entry in raw_history
-        ]
+        self._history = _to_groq(raw_history)
 
     def reset_session(self) -> None:
         self._history = []
 
     def respond(self, user_text: str, vault: Vault) -> str:
-        """Send user_text to Gemini, execute any skill, return spoken reply."""
+        """Send user_text to LLM, execute any skill, return spoken reply."""
 
-        self._history.append(
-            types.Content(role="user", parts=[types.Part(text=user_text)])
-        )
+        self._history.append({"role": "user", "content": user_text})
 
-        response = _client.models.generate_content(
-            model=MODEL,
-            contents=self._history,
-            config=types.GenerateContentConfig(system_instruction=self._system),
-        )
+        raw = _chat(self._history, self._system)
 
-        raw = response.text.strip()
-
-        self._history.append(
-            types.Content(role="model", parts=[types.Part(text=raw)])
-        )
+        self._history.append({"role": "assistant", "content": raw})
 
         skill_result, spoken = _try_invoke_skill(raw)
 
         if skill_result is not None:
             if spoken:
-                # Inject skill result into spoken text if placeholder exists
                 final = spoken.replace("{result}", skill_result)
-                # If no placeholder, append result naturally via a follow-up
                 if "{result}" not in spoken:
-                    narrate = types.Content(
-                        role="user",
-                        parts=[types.Part(text=f"The skill returned this result: {skill_result}\nNow give a short natural spoken summary of this result.")],
+                    narrate = f"The skill returned this result: {skill_result}\nNow give a short natural spoken summary of this result."
+                    final = _chat(
+                        self._history + [{"role": "user", "content": narrate}],
+                        self._system,
                     )
-                    followup = _client.models.generate_content(
-                        model=MODEL,
-                        contents=self._history + [narrate],
-                        config=types.GenerateContentConfig(system_instruction=self._system),
-                    )
-                    final = followup.text.strip()
             else:
-                # No spoken text at all — narrate the result
-                narrate = types.Content(
-                    role="user",
-                    parts=[types.Part(text=f"The skill returned this result: {skill_result}\nNow give a short natural spoken summary of this result.")],
+                narrate = f"The skill returned this result: {skill_result}\nNow give a short natural spoken summary of this result."
+                final = _chat(
+                    self._history + [{"role": "user", "content": narrate}],
+                    self._system,
                 )
-                followup = _client.models.generate_content(
-                    model=MODEL,
-                    contents=self._history + [narrate],
-                    config=types.GenerateContentConfig(system_instruction=self._system),
-                )
-                final = followup.text.strip()
             return final
 
         return spoken or raw
