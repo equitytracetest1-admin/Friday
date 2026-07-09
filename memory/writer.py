@@ -72,3 +72,34 @@ def load_session(session_id: str) -> list[dict]:
 def list_sessions() -> list[str]:
     """Return a sorted list of session IDs that have been persisted."""
     return sorted(p.stem for p in LOGS_DIR.glob("*.jsonl"))
+
+
+# ── NEW: Bootstrap from last session ─────────────────────────────────────────
+
+def load_last_session(vault: Vault, max_turns: int = 20) -> int:
+    """
+    Find the most recent JSONL session log and load its last `max_turns`
+    turns into the vault so Friday remembers the previous conversation.
+    Returns the number of turns loaded (0 if no past session found).
+
+    Call this BEFORE assistant.start_session(vault) in main.py.
+    """
+    sessions = list_sessions()
+    if not sessions:
+        return 0
+
+    # Skip the current session's own file (it's empty/new)
+    past = [s for s in reversed(sessions) if s != vault.session_id]
+    if not past:
+        return 0
+
+    records = load_session(past[0])   # most recent past session
+    if not records:
+        return 0
+
+    tail = records[-max_turns:]
+    for rec in tail:
+        vault.push(rec["role"], rec["text"])
+
+    print(f"[Memory] Loaded {len(tail)} turns from session '{past[0]}'")
+    return len(tail)

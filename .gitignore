@@ -5,3 +5,7 @@ __pycache__/
 memory/logs/
 .vscode/
 .venv/
+conversations/
+facts/
+preferences/
+projects

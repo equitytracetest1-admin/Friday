@@ -10,32 +10,31 @@ import json
 from groq import Groq, RateLimitError
 from dotenv import load_dotenv
 
-from memory.vault  import Vault
-from memory.recall import recent_history
+from memory.vault    import Vault
+from memory.recall   import recent_history
+from memory.memory_manager import (
+    init_memory,
+    load_memory_for_prompt,
+    log_conversation,
+    extract_and_store_async,
+)
 
 load_dotenv(".env.local")
 
 # ── Models ────────────────────────────────────────────────────────────────────
-PRIMARY_MODEL = "llama-3.3-70b-versatile"   # 1,000 req/day  — best reasoning
-BACKUP_MODEL  = "llama-3.1-8b-instant"      # 14,400 req/day — fast fallback
+PRIMARY_MODEL = "llama-3.3-70b-versatile"
+BACKUP_MODEL  = "llama-3.1-8b-instant"
 
 _client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-# Track which model is active this session
-_active_model  = PRIMARY_MODEL
+_active_model      = PRIMARY_MODEL
 _primary_exhausted = False
 
 # ── Notification ──────────────────────────────────────────────────────────────
 def _notify(title: str, message: str) -> None:
-    """Send a Windows toast notification (silent fallback to print)."""
     try:
         from plyer import notification
-        notification.notify(
-            title=title,
-            message=message,
-            app_name="Friday",
-            timeout=6,
-        )
+        notification.notify(title=title, message=message, app_name="Friday", timeout=6)
     except Exception:
         pass
     print(f"\n🔔  [{title}] {message}\n")
@@ -84,7 +83,6 @@ The JSON must be the very first thing in your response. No intro text before it.
 After the JSON line, write the spoken reply naturally.
 
 Humor should:
-
 * Fit naturally into the conversation.
 * Include occasional jokes, sarcasm, playful teasing, and callbacks.
 * Never interfere with technical accuracy.
@@ -97,11 +95,21 @@ Available skills:
 """
 
 def _build_system_prompt() -> str:
-    return _SYSTEM_BASE + _skills_block() + "\n\nIf no skill is needed, just reply with plain spoken text — no JSON at all."
+    base    = _SYSTEM_BASE + _skills_block()
+    base   += "\n\nIf no skill is needed, just reply with plain spoken text — no JSON at all."
+
+    # ── Inject long-term memory ───────────────────────────────────────────────
+    memory  = load_memory_for_prompt()
+    if memory:
+        base += f"\n\n<memory>\nHere is what you know about the user and their projects:\n{memory}\n</memory>"
+
+    return base
+
 
 def _load_skills():
     from skills import SKILLS
     return SKILLS
+
 
 def _skills_block() -> str:
     skills = _load_skills()
@@ -119,9 +127,9 @@ def _try_invoke_skill(raw: str) -> tuple[str | None, str]:
         return None, raw
 
     try:
-        data  = json.loads(match.group(1))
-        name  = data.get("skill", "")
-        args  = data.get("args", {})
+        data   = json.loads(match.group(1))
+        name   = data.get("skill", "")
+        args   = data.get("args", {})
         skills = _load_skills()
 
         if name in skills:
@@ -137,13 +145,9 @@ def _try_invoke_skill(raw: str) -> tuple[str | None, str]:
 
 # ── Groq chat wrapper ─────────────────────────────────────────────────────────
 def _chat(messages: list[dict], system: str) -> str:
-    """
-    Call Groq with automatic fallback from primary → backup model.
-    Raises RuntimeError if both models are exhausted.
-    """
     global _active_model
 
-    for attempt in range(2):  # at most 2 attempts: primary then backup
+    for attempt in range(2):
         model = _get_model()
         try:
             response = _client.chat.completions.create(
@@ -155,9 +159,8 @@ def _chat(messages: list[dict], system: str) -> str:
         except RateLimitError:
             if model == PRIMARY_MODEL:
                 _switch_to_backup()
-                continue  # retry with backup
+                continue
             else:
-                # Backup also exhausted
                 _notify(
                     "Friday — All Models Exhausted",
                     f"Backup model ({BACKUP_MODEL}) quota also exhausted.\n"
@@ -170,12 +173,10 @@ def _chat(messages: list[dict], system: str) -> str:
 
 # ── History helpers ───────────────────────────────────────────────────────────
 def _to_groq(history: list[dict]) -> list[dict]:
-    """Ensure history is in Groq's plain dict format."""
     result = []
     for entry in history:
         role  = entry.get("role", "user")
         parts = entry.get("parts", [])
-        # Handle both Groq dicts and Gemini Content objects
         if isinstance(parts, list):
             text = " ".join(
                 p if isinstance(p, str) else getattr(p, "text", str(p))
@@ -183,18 +184,22 @@ def _to_groq(history: list[dict]) -> list[dict]:
             )
         else:
             text = str(parts)
-        result.append({"role": role, "content": text})
+        # Groq uses "assistant" not "model"
+        result.append({"role": "assistant" if role == "model" else role, "content": text})
     return result
 
 
 # ── Assistant class ───────────────────────────────────────────────────────────
 class Assistant:
     def __init__(self):
-        self._system  = _build_system_prompt()
-        self._history : list[dict] = []   # Groq format: [{"role":..,"content":..}]
+        init_memory()                              # ensure memory dirs exist
+        self._system  = _build_system_prompt()    # includes long-term memory
+        self._history : list[dict] = []
 
     def start_session(self, vault: Vault) -> None:
-        raw_history = recent_history(vault)
+        """Load recent history from vault (which may have been pre-populated
+        from a past JSONL session via load_last_session in main.py)."""
+        raw_history   = recent_history(vault)
         self._history = _to_groq(raw_history)
 
     def reset_session(self) -> None:
@@ -215,17 +220,25 @@ class Assistant:
             if spoken:
                 final = spoken.replace("{result}", skill_result)
                 if "{result}" not in spoken:
-                    narrate = f"The skill returned this result: {skill_result}\nNow give a short natural spoken summary of this result."
-                    final = _chat(
+                    narrate = f"The skill returned: {skill_result}\nGive a short natural spoken summary."
+                    final   = _chat(
                         self._history + [{"role": "user", "content": narrate}],
                         self._system,
                     )
             else:
-                narrate = f"The skill returned this result: {skill_result}\nNow give a short natural spoken summary of this result."
-                final = _chat(
+                narrate = f"The skill returned: {skill_result}\nGive a short natural spoken summary."
+                final   = _chat(
                     self._history + [{"role": "user", "content": narrate}],
                     self._system,
                 )
-            return final
+        else:
+            final = spoken or raw
 
-        return spoken or raw
+        # ── Persist to Markdown conversation log ──────────────────────────────
+        log_conversation("user",   user_text)
+        log_conversation("friday", final)
+
+        # ── Background memory extraction ──────────────────────────────────────
+        extract_and_store_async(user_text, final)
+
+        return final

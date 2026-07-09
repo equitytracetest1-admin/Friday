@@ -10,7 +10,7 @@ from stt.groq_stt    import listen
 from tts.kokoro_tts  import speak
 from agent.assistant import Assistant
 from memory.vault    import Vault
-from memory.writer   import add_user, add_assistant
+from memory.writer   import add_user, add_assistant, load_last_session  # ← added
 
 WAKE_WORD    = "friday"
 EXIT_PHRASES = {"goodbye", "bye", "exit", "quit", "stop", "shut down"}
@@ -28,21 +28,18 @@ def main():
     print("  🤖  Friday — Voice AI Assistant")
     print("=" * 52)
     print(f"  STT       : Groq Whisper (whisper-large-v3-turbo)")
-    print(f"  LLM       : Gemini 2.5 Flash")
+    print(f"  LLM       : Groq LLaMA (llama-3.3-70b-versatile)")
     print(f"  TTS       : Kokoro (local)")
     print(f"  Wake word : '{WAKE_WORD}' — say it once to activate")
     print("  Ctrl-C to quit.")
     print("=" * 52 + "\n")
 
     vault     = Vault()
+    load_last_session(vault)          # ← loads previous session into vault
     assistant = Assistant()
-    assistant.start_session(vault)
+    assistant.start_session(vault)    # ← now has actual history to work with
 
-    # ── Two-state loop ────────────────────────────────────────────────────────
-    # State 1: SLEEPING — waiting for wake word
-    # State 2: ACTIVE   — responding freely, no wake word needed
     active = False
-
     print("😴 Sleeping... say 'Friday' to wake me up.\n")
 
     while True:
@@ -50,32 +47,25 @@ def main():
         if not text:
             continue
 
-        # ── SLEEPING: wait for wake word ──────────────────────────────────
         if not active:
             if WAKE_WORD in text.lower():
                 active = True
-                # Check if there's a query after the wake word
-                query = text.lower().replace(WAKE_WORD, "", 1).strip()
+                query  = text.lower().replace(WAKE_WORD, "", 1).strip()
                 print("✅ Activated!\n")
                 if not query:
                     speak("Hey! What can I do for you?")
                     continue
-                # Fall through to process the inline query
             else:
-                continue  # Not awake yet, ignore
-
+                continue
         else:
             query = text
 
-        # ── ACTIVE: process every utterance ──────────────────────────────
-        # Exit check
         if any(phrase in query.lower() for phrase in EXIT_PHRASES):
             speak("Goodbye! Have a great day.")
             active = False
             print("😴 Sleeping... say 'Friday' to wake me up.\n")
-            continue  # Go back to sleep instead of quitting entirely
+            continue
 
-        # Think and respond
         add_user(vault, query)
         print("⚙️  Thinking...")
 
