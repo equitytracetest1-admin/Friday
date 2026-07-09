@@ -13,11 +13,11 @@ from memory.vault    import Vault
 from memory.writer   import add_user, add_assistant, load_last_session  # ← added
 
 WAKE_WORD    = "friday"
-EXIT_PHRASES = {"goodbye", "bye", "exit", "quit", "stop", "shut down"}
+EXIT_PHRASES = {"goodbye", "bye", "exit", "quit", "stop", "shut down", "go to sleep", "peace out"}
 
 
 def _handle_exit(sig, frame):
-    print("\n👋 Shutting down Friday. Goodbye!")
+    print("\n👋 i'm going to sleep boss. See ya!")
     sys.exit(0)
 
 
@@ -25,7 +25,7 @@ def main():
     signal.signal(signal.SIGINT, _handle_exit)
 
     print("=" * 52)
-    print("  🤖  Friday — Voice AI Assistant")
+    print("  🤖  Friday — AI Assistant")
     print("=" * 52)
     print(f"  STT       : Groq Whisper (whisper-large-v3-turbo)")
     print(f"  LLM       : Groq LLaMA (llama-3.3-70b-versatile)")
@@ -53,7 +53,7 @@ def main():
                 query  = text.lower().replace(WAKE_WORD, "", 1).strip()
                 print("✅ Activated!\n")
                 if not query:
-                    speak("Hey! What can I do for you?")
+                    speak("Friday, Online boss. What can I do for you?")
                     continue
             else:
                 continue
@@ -63,7 +63,7 @@ def main():
         if any(phrase in query.lower() for phrase in EXIT_PHRASES):
             speak("Goodbye! Have a great day.")
             active = False
-            print("😴 Sleeping... say 'Friday' to wake me up.\n")
+            print("😴 Sleeping... say 'Friday' to wake up.\n")
             continue
 
         add_user(vault, query)

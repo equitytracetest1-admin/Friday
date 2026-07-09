@@ -9,3 +9,5 @@ conversations/
 facts/
 preferences/
 projects
+.obsidian/
+logs/

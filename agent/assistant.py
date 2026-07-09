@@ -33,8 +33,8 @@ _primary_exhausted = False
 # ── Notification ──────────────────────────────────────────────────────────────
 def _notify(title: str, message: str) -> None:
     try:
-        from plyer import notification
-        notification.notify(title=title, message=message, app_name="Friday", timeout=6)
+        import plyer  # type: ignore
+        plyer.notification.notify(title=title, message=message, app_name="Friday", timeout=6)  # type: ignore
     except Exception:
         pass
     print(f"\n🔔  [{title}] {message}\n")
@@ -56,9 +56,18 @@ def _switch_to_backup() -> None:
         )
 
 
+# ── Fix #3: Strip leaked JSON from spoken output ──────────────────────────────
+def _clean_spoken(text: str) -> str:
+    """Remove any lines that look like raw JSON — backup model sometimes leaks these."""
+    lines   = text.strip().splitlines()
+    cleaned = [l for l in lines if not l.strip().startswith("{")]
+    return "\n".join(cleaned).strip()
+
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 _SYSTEM_BASE = """\
 You are Friday, a fast and helpful voice AI assistant like Friday from the movie Iron man.
+Environment: Windows. Always use Windows shell commands (dir, type, cd, etc.) Never use ls, cat, or other Unix commands.
 Your replies will be spoken aloud, so:
   - Be concise and natural — one or two sentences is ideal.
   - Never use markdown, bullet points, code blocks, or special characters.
@@ -95,11 +104,11 @@ Available skills:
 """
 
 def _build_system_prompt() -> str:
-    base    = _SYSTEM_BASE + _skills_block()
-    base   += "\n\nIf no skill is needed, just reply with plain spoken text — no JSON at all."
+    base  = _SYSTEM_BASE + _skills_block()
+    base += "\n\nIf no skill is needed, just reply with plain spoken text — no JSON at all."
 
     # ── Inject long-term memory ───────────────────────────────────────────────
-    memory  = load_memory_for_prompt()
+    memory = load_memory_for_prompt()
     if memory:
         base += f"\n\n<memory>\nHere is what you know about the user and their projects:\n{memory}\n</memory>"
 
@@ -152,9 +161,9 @@ def _chat(messages: list[dict], system: str) -> str:
         try:
             response = _client.chat.completions.create(
                 model=model,
-                messages=[{"role": "system", "content": system}] + messages,
+                messages=[{"role": "system", "content": system}] + messages, #type: ignore
             )
-            return response.choices[0].message.content.strip()
+            return (response.choices[0].message.content or "").strip()
 
         except RateLimitError:
             if model == PRIMARY_MODEL:
@@ -184,7 +193,6 @@ def _to_groq(history: list[dict]) -> list[dict]:
             )
         else:
             text = str(parts)
-        # Groq uses "assistant" not "model"
         result.append({"role": "assistant" if role == "model" else role, "content": text})
     return result
 
@@ -192,13 +200,11 @@ def _to_groq(history: list[dict]) -> list[dict]:
 # ── Assistant class ───────────────────────────────────────────────────────────
 class Assistant:
     def __init__(self):
-        init_memory()                              # ensure memory dirs exist
-        self._system  = _build_system_prompt()    # includes long-term memory
+        init_memory()
+        self._system  = _build_system_prompt()
         self._history : list[dict] = []
 
     def start_session(self, vault: Vault) -> None:
-        """Load recent history from vault (which may have been pre-populated
-        from a past JSONL session via load_last_session in main.py)."""
         raw_history   = recent_history(vault)
         self._history = _to_groq(raw_history)
 
@@ -210,27 +216,40 @@ class Assistant:
 
         self._history.append({"role": "user", "content": user_text})
 
-        raw = _chat(self._history, self._system)
+        # Fix #3: clean any leaked JSON from the raw LLM response
+        raw = _clean_spoken(_chat(self._history, self._system))
 
         self._history.append({"role": "assistant", "content": raw})
 
         skill_result, spoken = _try_invoke_skill(raw)
 
         if skill_result is not None:
-            if spoken:
+            # Fix #2: detect skill errors and respond honestly instead of hallucinating
+            error_signals = ["not recognized", "file not found", "error", "access denied", "cannot find"]
+            is_error = any(sig in skill_result.lower() for sig in error_signals)
+
+            if is_error:
+                narrate = (
+                    f"The skill failed with this error: {skill_result}\n"
+                    f"Tell the user honestly and briefly what went wrong. Do not guess or make up results."
+                )
+            elif spoken:
                 final = spoken.replace("{result}", skill_result)
                 if "{result}" not in spoken:
                     narrate = f"The skill returned: {skill_result}\nGive a short natural spoken summary."
-                    final   = _chat(
+                    final = _chat(
                         self._history + [{"role": "user", "content": narrate}],
                         self._system,
                     )
+                return final
             else:
                 narrate = f"The skill returned: {skill_result}\nGive a short natural spoken summary."
-                final   = _chat(
-                    self._history + [{"role": "user", "content": narrate}],
-                    self._system,
-                )
+
+            final = _chat(
+                self._history + [{"role": "user", "content": narrate}],
+                self._system,
+            )
+            return final
         else:
             final = spoken or raw
 
