@@ -1,4 +1,5 @@
 {
-  "pythonVersion": "3.11",
-  "extraPaths": ["."]
+  "extraPaths": ["."],
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "basic"
 }

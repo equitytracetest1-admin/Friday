@@ -56,12 +56,96 @@ def _switch_to_backup() -> None:
         )
 
 
-# ── Fix #3: Strip leaked JSON from spoken output ──────────────────────────────
+# ── Shell-command line pattern (for _clean_spoken) ────────────────────────────
+_SHELL_CMD_RE = re.compile(
+    r'^('
+    r'mkdir|md|rmdir|rd|del|erase|copy|xcopy|robocopy|move|rename|ren'
+    r'|dir|tree|attrib|mklink|fc|icacls|compact'
+    r'|type|more|sort|findstr|find|echo'
+    r'|start|tasklist|taskkill|where'
+    r'|python|pip|git|node|npm|npx|code|powershell'
+    r'|ping|ipconfig|curl|wget|nslookup'
+    r'|systeminfo|set|cd|clip|wmic'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def _find_skill_json(text: str) -> tuple[str | None, int, int]:
+    """
+    Scan `text` for the first valid skill JSON object — works regardless of
+    where in the response the model placed it (start, middle, or end).
+
+    Uses a character-level brace scanner so nested braces inside argument
+    strings (e.g. python -c "...") don't confuse it.
+
+    Returns (json_string, start_index, end_index) or (None, -1, -1).
+    """
+    search_start = 0
+    while True:
+        # Find the next opening brace
+        idx = text.find("{", search_start)
+        if idx == -1:
+            return None, -1, -1
+
+        # Walk forward tracking depth, respecting quoted strings
+        depth     = 0
+        in_string = False
+        escaped   = False
+
+        for i in range(idx, len(text)):
+            ch = text[i]
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\" and in_string:
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[idx : i + 1]
+                    try:
+                        data = json.loads(candidate)
+                        if "skill" in data:          # must look like a skill call
+                            return candidate, idx, i + 1
+                    except json.JSONDecodeError:
+                        pass
+                    break   # invalid JSON at this brace — keep searching
+
+        search_start = idx + 1
+
+    return None, -1, -1   # unreachable, satisfies type checkers
+
+
 def _clean_spoken(text: str) -> str:
-    """Remove any lines that look like raw JSON — backup model sometimes leaks these."""
-    lines   = text.strip().splitlines()
-    cleaned = [l for l in lines if not l.strip().startswith("{")]
-    return "\n".join(cleaned).strip()
+    """
+    Remove content that would be jarring if spoken aloud:
+      • Skill JSON objects (anywhere in the text)
+      • Lines that start with a raw JSON object
+      • Lines that are bare shell commands
+    Collapses any resulting blank lines.
+    """
+    # Strip any skill JSON blobs that survived (safety net)
+    json_str, start, end = _find_skill_json(text)
+    while json_str is not None:
+        text = (text[:start] + text[end:]).strip()
+        json_str, start, end = _find_skill_json(text)
+
+    lines = text.splitlines()
+    cleaned = [
+        l for l in lines
+        if not l.strip().startswith("{")
+        and not _SHELL_CMD_RE.match(l.strip())
+    ]
+    return re.sub(r"\n{2,}", "\n", "\n".join(cleaned)).strip()
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -128,28 +212,100 @@ def _skills_block() -> str:
 
 
 # ── Skill invocation ──────────────────────────────────────────────────────────
-_SKILL_RE = re.compile(r'^\s*(\{[^\n]+\})\s*\n?(.*)', re.DOTALL)
 
-def _try_invoke_skill(raw: str) -> tuple[str | None, str]:
-    match = _SKILL_RE.match(raw)
-    if not match:
-        return None, raw
+_ERROR_SIGNALS = {
+    "not recognized", "file not found", "error", "access denied",
+    "cannot find", "failed", "not permitted", "timed out",
+}
 
+def _is_skill_error(result: str) -> bool:
+    low = result.lower()
+    return any(sig in low for sig in _ERROR_SIGNALS)
+
+
+def _run_skill_from_json(json_str: str) -> tuple[str | None, str]:
+    """
+    Parse a JSON skill call and execute it.
+    Returns (result, skill_name).
+    Returns (None, "") on parse failure or unknown skill.
+    """
     try:
-        data   = json.loads(match.group(1))
+        data   = json.loads(json_str)
         name   = data.get("skill", "")
         args   = data.get("args", {})
         skills = _load_skills()
 
-        if name in skills:
-            result = skills[name]["fn"](**args)
-            spoken = match.group(2).strip()
-            print(f"🔧 Skill '{name}' → {result}")
-            return str(result), spoken
-    except (json.JSONDecodeError, Exception):
-        pass
+        if name not in skills:
+            return None, name
 
-    return None, raw
+        result = skills[name]["fn"](**args)
+        print(f"🔧 Skill '{name}' → {result}")
+        return str(result), name
+
+    except json.JSONDecodeError:
+        return None, ""
+    except Exception as e:
+        return f"Exception while running skill: {e}", ""
+
+
+def _try_invoke_skill(
+    raw: str,
+    history: list[dict],
+    system: str,
+) -> tuple[str | None, str]:
+    """
+    Find and invoke a skill JSON object from ANYWHERE in `raw`.
+
+    The backup model often ignores the "JSON on first line" rule and buries
+    the JSON mid-sentence or at the end — this handles all placements.
+
+    Flow:
+      1. Scan raw for skill JSON (any position).
+      2. Remove JSON from spoken text.
+      3. Run skill → success → return (result, spoken).
+      4. Skill errors → one automatic LLM retry with corrected args.
+      5. Retry succeeds → return (result, spoken).
+      6. Retry also fails → return (error_msg, "") for honest reporting.
+      7. No skill found → return (None, raw).
+    """
+    json_str, start, end = _find_skill_json(raw)
+    if json_str is None:
+        return None, raw
+
+    # Strip the JSON blob from spoken text
+    spoken = (raw[:start] + raw[end:]).strip()
+
+    result, skill_name = _run_skill_from_json(json_str)
+
+    if result is None:
+        # Unknown skill or parse failure — return spoken without JSON
+        return None, spoken or raw
+
+    if _is_skill_error(result):
+        print(f"⚠️  Skill '{skill_name}' returned error: {result} — retrying…")
+        retry_prompt = (
+            f"The skill '{skill_name}' failed with: {result}\n"
+            f"Try again with corrected arguments or a different skill. "
+            f"Output ONLY the JSON skill invocation on the first line, then your spoken reply."
+        )
+        retry_raw = _chat(history + [{"role": "user", "content": retry_prompt}], system)
+
+        retry_json, r_start, r_end = _find_skill_json(retry_raw)
+        if retry_json:
+            retry_result, retry_name = _run_skill_from_json(retry_json)
+            if retry_result is not None and not _is_skill_error(retry_result):
+                retry_spoken = (retry_raw[:r_start] + retry_raw[r_end:]).strip()
+                print(f"✅ Retry skill '{retry_name}' succeeded.")
+                return retry_result, retry_spoken
+            error_msg = retry_result or result
+        else:
+            # LLM gave up on skills — use its plain text as the reply
+            return None, _clean_spoken(retry_raw)
+
+        print(f"❌ Retry also failed: {error_msg}")
+        return error_msg, ""   # caller speaks the error honestly
+
+    return result, spoken
 
 
 # ── Groq chat wrapper ─────────────────────────────────────────────────────────
@@ -216,42 +372,47 @@ class Assistant:
 
         self._history.append({"role": "user", "content": user_text})
 
-        # Fix #3: clean any leaked JSON from the raw LLM response
-        raw = _clean_spoken(_chat(self._history, self._system))
+        # 1. Get raw LLM output — do NOT clean yet; skill extraction reads it first
+        raw_llm = _chat(self._history, self._system)
 
-        self._history.append({"role": "assistant", "content": raw})
+        # 2. Extract skill JSON from anywhere in the response + run it
+        skill_result, spoken_dirty = _try_invoke_skill(raw_llm, self._history, self._system)
 
-        skill_result, spoken = _try_invoke_skill(raw)
+        # 3. Clean the spoken portion (strips JSON remnants, shell cmds, etc.)
+        spoken = _clean_spoken(spoken_dirty)
 
+        # 4. Store a clean (JSON-free) version in history so the LLM doesn't
+        #    repeat skill calls unnecessarily in future turns
+        self._history.append({"role": "assistant", "content": spoken or raw_llm})
+
+        # 5. Decide the final spoken reply
         if skill_result is not None:
-            # Fix #2: detect skill errors and respond honestly instead of hallucinating
-            error_signals = ["not recognized", "file not found", "error", "access denied", "cannot find"]
-            is_error = any(sig in skill_result.lower() for sig in error_signals)
-
-            if is_error:
+            if _is_skill_error(skill_result):
+                # Skill failed even after retry — tell the user honestly
                 narrate = (
-                    f"The skill failed with this error: {skill_result}\n"
-                    f"Tell the user honestly and briefly what went wrong. Do not guess or make up results."
+                    f"The skill failed with: {skill_result}\n"
+                    f"Tell the user honestly and briefly what went wrong. "
+                    f"Do not guess or make up results."
+                )
+                final = _chat(
+                    self._history + [{"role": "user", "content": narrate}],
+                    self._system,
                 )
             elif spoken:
-                final = spoken.replace("{result}", skill_result)
-                if "{result}" not in spoken:
-                    narrate = f"The skill returned: {skill_result}\nGive a short natural spoken summary."
-                    final = _chat(
-                        self._history + [{"role": "user", "content": narrate}],
-                        self._system,
-                    )
-                return final
+                # LLM already wrote a reply alongside the skill call — use it
+                final = spoken
             else:
-                narrate = f"The skill returned: {skill_result}\nGive a short natural spoken summary."
-
-            final = _chat(
-                self._history + [{"role": "user", "content": narrate}],
-                self._system,
-            )
-            return final
+                # No spoken text — ask LLM to summarise the result naturally
+                narrate = (
+                    f"The skill returned: {skill_result}\n"
+                    f"Give a short natural spoken summary."
+                )
+                final = _chat(
+                    self._history + [{"role": "user", "content": narrate}],
+                    self._system,
+                )
         else:
-            final = spoken or raw
+            final = spoken or raw_llm
 
         # ── Persist to Markdown conversation log ──────────────────────────────
         log_conversation("user",   user_text)

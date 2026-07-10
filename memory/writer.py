@@ -1,146 +1,127 @@
 """
-memory/writer.py — Write interface over the Vault
+memory/writer.py — Writes conversation turns to structured Markdown files.
 
-All mutations to the vault pass through here.
-Also handles persisting completed sessions to disk as:
-  - JSONL  → memory/logs/          (for Friday's internal recall)
-  - Markdown → memory/knowledge/conversations/  (for Obsidian)
+File layout:
+    vault/conversations/YYYY-MM-DD/session_HHMMSS.md
+
+Each file gets YAML frontmatter so it's human-readable in Obsidian
+and machine-readable for the RAG pipeline in Step 2.
 """
 
-import json
-from datetime import datetime
+import os
+from datetime import datetime, date
 from pathlib import Path
+
 from memory.vault import Vault
 
-LOGS_DIR  = Path(__file__).parent / "logs"
-OBSIDIAN_DIR = Path(__file__).parent / "knowledge" / "conversations"
+# ── Vault root (set via env or default) ───────────────────────────────────────
+VAULT_ROOT = Path(os.environ.get("FRIDAY_VAULT", "vault"))
+CONV_DIR   = VAULT_ROOT / "conversations"
+FACTS_DIR  = VAULT_ROOT / "facts"
 
-LOGS_DIR.mkdir(exist_ok=True)
-OBSIDIAN_DIR.mkdir(parents=True, exist_ok=True)
+# ── Session file (one per run) ────────────────────────────────────────────────
+_session_file: Path | None = None
+_session_start: datetime   | None = None
 
 
-# ── Mutation helpers ──────────────────────────────────────────────────────────
+def _ensure_dirs() -> None:
+    CONV_DIR.mkdir(parents=True, exist_ok=True)
+    FACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _get_session_file() -> Path:
+    """Return (and lazily create) today's session file."""
+    global _session_file, _session_start
+
+    if _session_file is not None:
+        return _session_file
+
+    _ensure_dirs()
+
+    now              = datetime.now()
+    _session_start   = now
+    day_dir          = CONV_DIR / now.strftime("%Y-%m-%d")
+    day_dir.mkdir(parents=True, exist_ok=True)
+
+    filename         = f"session_{now.strftime('%H%M%S')}.md"
+    _session_file    = day_dir / filename
+
+    # Write YAML frontmatter on creation
+    _session_file.write_text(
+        f"---\n"
+        f"date: {now.strftime('%Y-%m-%d')}\n"
+        f"time: {now.strftime('%H:%M:%S')}\n"
+        f"tags: [conversation, friday]\n"
+        f"related: []\n"
+        f"---\n\n"
+        f"# Session — {now.strftime('%Y-%m-%d %H:%M:%S')}\n\n",
+        encoding="utf-8",
+    )
+
+    return _session_file
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
 
 def add_user(vault: Vault, text: str) -> None:
-    """Record a user turn in the vault."""
-    vault.push("user", text)
+    """Append a user turn to the in-memory vault and the session file."""
+    vault.add("user", text)
+    _append_turn("user", text)
 
 
 def add_assistant(vault: Vault, text: str) -> None:
-    """Record an assistant turn in the vault and persist to disk."""
-    vault.push("model", text)
-    _persist(vault)
+    """Append an assistant turn to the in-memory vault and the session file."""
+    vault.add("assistant", text)
+    _append_turn("friday", text)
 
 
-def reset(vault: Vault) -> None:
-    """Wipe the in-memory vault (does not delete the log file)."""
-    vault.clear()
+def _append_turn(role: str, text: str) -> None:
+    f    = _get_session_file()
+    ts   = datetime.now().strftime("%H:%M:%S")
+    icon = "🧑" if role == "user" else "🤖"
+    with f.open("a", encoding="utf-8") as fh:
+        fh.write(f"**[{ts}] {icon} {role.capitalize()}:** {text}\n\n")
 
 
-# ── Persistence ───────────────────────────────────────────────────────────────
-
-def _persist(vault: Vault) -> None:
+def load_last_session(vault: Vault) -> None:
     """
-    Append the latest turn to:
-      1. A per-session JSONL file  (memory/logs/<session_id>.jsonl)
-      2. A per-session Markdown file (memory/knowledge/conversations/<session_id>.md)
+    On startup, load the most recent session file into the vault
+    so the assistant has conversational continuity.
+    Loads at most the last 40 turns to keep the context window sane.
     """
-    latest = vault.turns[-1]
+    _ensure_dirs()
 
-    record = {
-        "role": latest.role,
-        "text": latest.text,
-        "ts"  : latest.timestamp.isoformat(),
-    }
-
-    # ── 1. JSONL (Friday's internal use) ─────────────────────────────────────
-    log_path = LOGS_DIR / f"{vault.session_id}.jsonl"
-    with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record) + "\n")
-
-    # ── 2. Markdown (Obsidian) ────────────────────────────────────────────────
-    md_path = OBSIDIAN_DIR / f"{vault.session_id}.md"
-    _append_md(md_path, vault.session_id, latest.role, latest.text, latest.timestamp)
+    # Walk date folders newest-first
+    day_dirs = sorted(CONV_DIR.glob("*/"), reverse=True)
+    for day_dir in day_dirs:
+        sessions = sorted(day_dir.glob("session_*.md"), reverse=True)
+        if sessions:
+            _load_session_into_vault(sessions[0], vault)
+            return
 
 
-def _append_md(path: Path, session_id: str, role: str, text: str, ts: datetime) -> None:
-    """
-    Append a single turn to the Markdown log.
-    Creates the file with a YAML front-matter header on first write.
-    """
-    is_new = not path.exists()
+def _load_session_into_vault(path: Path, vault: Vault) -> None:
+    """Parse a session .md file and push turns into the vault."""
+    MAX_TURNS = 40
+    turns: list[tuple[str, str]] = []
 
-    with open(path, "a", encoding="utf-8") as fh:
-        # Write front-matter once when the file is first created
-        if is_new:
-            date_str = ts.strftime("%Y-%m-%d")
-            fh.write(f"---\n")
-            fh.write(f"session: {session_id}\n")
-            fh.write(f"date: {date_str}\n")
-            fh.write(f"tags: [friday, conversation]\n")
-            fh.write(f"---\n\n")
-            fh.write(f"# 🤖 Friday — Session {session_id}\n\n")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
 
-        # Format the turn
-        time_str = ts.strftime("%H:%M:%S")
-        if role == "user":
-            fh.write(f"**[{time_str}] 🧑 You:** {text}\n\n")
-        else:
-            fh.write(f"**[{time_str}] 🤖 Friday:** {text}\n\n")
-        fh.write("---\n\n")
+    for line in text.splitlines():
+        # Matches lines like: **[HH:MM:SS] 🧑 User:** some text
+        if line.startswith("**[") and "]" in line and ":**" in line:
+            after_colon = line.split(":**", 1)
+            if len(after_colon) < 2:
+                continue
+            content = after_colon[1].strip()
+            role    = "user" if "User" in after_colon[0] else "assistant"
+            turns.append((role, content))
 
+    # Keep only the last MAX_TURNS turns
+    for role, content in turns[-MAX_TURNS:]:
+        vault.add(role, content)
 
-# ── Session loading ───────────────────────────────────────────────────────────
-
-def load_session(session_id: str) -> list[dict]:
-    """
-    Load a past session from its JSONL file.
-    Returns a list of {"role", "text", "ts"} dicts, oldest-first.
-    """
-    log_path = LOGS_DIR / f"{session_id}.jsonl"
-    if not log_path.exists():
-        return []
-
-    records = []
-    with open(log_path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
-
-
-def list_sessions() -> list[str]:
-    """Return a sorted list of session IDs that have been persisted."""
-    return sorted(p.stem for p in LOGS_DIR.glob("*.jsonl"))
-
-
-# ── Bootstrap from last session ───────────────────────────────────────────────
-
-def load_last_session(vault: Vault, max_turns: int = 20) -> int:
-    """
-    Find the most recent JSONL session log and load its last `max_turns`
-    turns into the vault so Friday remembers the previous conversation.
-    Returns the number of turns loaded (0 if no past session found).
-
-    Call this BEFORE assistant.start_session(vault) in main.py.
-    """
-    sessions = list_sessions()
-    if not sessions:
-        return 0
-
-    # Skip the current session's own file (it's empty/new)
-    past = [s for s in reversed(sessions) if s != vault.session_id]
-    if not past:
-        return 0
-
-    records = load_session(past[0])   # most recent past session
-    if not records:
-        return 0
-
-    tail = records[-max_turns:]
-    for rec in tail:
-        vault.push(rec["role"], rec["text"])
-
-    print(f"[Memory] Loaded {len(tail)} turns from session '{past[0]}'")
-    return len(tail)
+    print(f"📂 Loaded {min(len(turns), MAX_TURNS)} turns from {path.name}")

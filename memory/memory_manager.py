@@ -1,254 +1,128 @@
 """
-memory/memory_manager.py — Long-term persistent memory for Friday
+memory/memory_manager.py — High-level memory API used by assistant.py.
 
-Stores projects, preferences, facts, and conversation logs as Markdown files.
-Obsidian-compatible: every file has YAML frontmatter.
-
-Directory layout (all inside friday/memory/):
-  projects/      → one .md file per project
-  preferences/   → preferences.md
-  facts/         → facts.md
-  conversations/ → YYYY-MM-DD.md  (daily logs)
-
-Quick usage:
-  from memory.memory_manager import init_memory, load_memory_for_prompt, extract_and_store
+Responsibilities:
+  - init_memory()              → ensure vault folders exist
+  - load_memory_for_prompt()   → read all fact files → return as a string block
+  - log_conversation()         → write a turn to the session file (via writer.py)
+  - extract_and_store_async()  → background thread: ask LLM to pull facts from
+                                  the conversation and save them to vault/facts/
 """
 
+from __future__ import annotations
+
 import os
-import json
-import re
 import threading
-from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-from dotenv import load_dotenv
+VAULT_ROOT = Path(os.environ.get("FRIDAY_VAULT", "vault"))
+FACTS_DIR  = VAULT_ROOT / "facts"
+CONV_DIR   = VAULT_ROOT / "conversations"
 
-MEMORY_ROOT = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=MEMORY_ROOT.parents[0] / ".env.local")
-
-STORES = {
-    "projects":      MEMORY_ROOT / "projects",
-    "preferences":   MEMORY_ROOT / "preferences",
-    "facts":         MEMORY_ROOT / "facts",
-    "conversations": MEMORY_ROOT / "conversations",
-}
-
-MAX_CONTEXT_CHARS = 6000   # cap on memory injected into every prompt
+# ── writer singleton (lazy import to avoid circular deps) ─────────────────────
+_session_appender = None
 
 
-# ── Bootstrap ─────────────────────────────────────────────────────────────────
+def init_memory() -> None:
+    """Create vault directory structure on startup."""
+    FACTS_DIR.mkdir(parents=True, exist_ok=True)
+    CONV_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"📁 Vault ready at: {VAULT_ROOT.resolve()}")
 
-def init_memory():
-    """Create all memory directories and seed starter files if missing."""
-    for path in STORES.values():
-        path.mkdir(parents=True, exist_ok=True)
-
-    _seed("preferences/preferences.md", _PREF_TEMPLATE)
-    _seed("facts/facts.md", _FACTS_TEMPLATE)
-    print("[Memory] Long-term memory ready.")
-
-
-def _seed(rel: str, content: str):
-    p = MEMORY_ROOT / rel
-    if not p.exists():
-        p.write_text(content, encoding="utf-8")
-
-
-# ── Read ───────────────────────────────────────────────────────────────────────
 
 def load_memory_for_prompt() -> str:
     """
-    Build a memory block to inject into Friday's system prompt.
-    Covers: facts, preferences, and all project files.
-    Capped at MAX_CONTEXT_CHARS to stay token-friendly.
+    Read all .md files in vault/facts/ and return them as a single
+    string block to inject into the system prompt.
+
+    Strips YAML frontmatter so the LLM only sees clean Markdown.
+    Returns empty string if no fact files exist yet.
     """
-    sections = []
+    fact_files = sorted(FACTS_DIR.glob("*.md"))
+    if not fact_files:
+        return ""
 
-    facts = _read("facts/facts.md")
-    if facts:
-        sections.append(f"## Long-term Facts\n{facts}")
+    blocks: list[str] = []
+    for path in fact_files:
+        try:
+            text = path.read_text(encoding="utf-8")
+            text = _strip_frontmatter(text)
+            if text.strip():
+                blocks.append(f"### {path.stem}\n{text.strip()}")
+        except OSError:
+            continue
 
-    prefs = _read("preferences/preferences.md")
-    if prefs:
-        sections.append(f"## User Preferences\n{prefs}")
-
-    proj_files = sorted(STORES["projects"].glob("*.md"))
-    if proj_files:
-        chunks = []
-        for p in proj_files:
-            text = p.read_text(encoding="utf-8")
-            preview = "\n".join(text.splitlines()[:25])
-            chunks.append(f"### {p.stem}\n{preview}")
-        sections.append("## Projects\n" + "\n\n".join(chunks))
-
-    combined = "\n\n".join(sections)
-    if len(combined) > MAX_CONTEXT_CHARS:
-        combined = combined[:MAX_CONTEXT_CHARS] + "\n\n[memory truncated]"
-    return combined
+    return "\n\n".join(blocks)
 
 
-def get_project(name: str) -> Optional[str]:
-    path = STORES["projects"] / f"{_slug(name)}.md"
-    return path.read_text(encoding="utf-8") if path.exists() else None
+def _strip_frontmatter(text: str) -> str:
+    """Remove YAML frontmatter block (--- ... ---) from markdown text."""
+    if not text.startswith("---"):
+        return text
+    end = text.find("---", 3)
+    if end == -1:
+        return text
+    return text[end + 3:].lstrip("\n")
 
 
-def list_projects() -> list[str]:
-    return [p.stem for p in STORES["projects"].glob("*.md")]
-
-
-# ── Write ──────────────────────────────────────────────────────────────────────
-
-def log_conversation(role: str, text: str):
-    """Append a turn to today's Markdown conversation log."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    path  = STORES["conversations"] / f"{today}.md"
-
-    if not path.exists():
-        path.write_text(
-            f"---\ndate: {today}\ntags: [conversation]\n---\n\n# {today}\n\n",
-            encoding="utf-8",
-        )
-
-    ts    = datetime.now().strftime("%H:%M:%S")
-    label = "USER" if role == "user" else "FRIDAY"
-    with path.open("a", encoding="utf-8") as f:
-        f.write(f"\n**[{ts}] {label}:** {text}\n")
-
-
-def upsert_project(name: str, details: str):
-    path = STORES["projects"] / f"{_slug(name)}.md"
-    now  = datetime.now().isoformat()
-    if path.exists():
-        text = path.read_text(encoding="utf-8")
-        text = re.sub(r"updated: .*", f"updated: {now}", text)
-        text += f"\n\n> **{datetime.now().strftime('%Y-%m-%d %H:%M')}:** {details}\n"
-        path.write_text(text, encoding="utf-8")
-    else:
-        path.write_text(
-            f"---\nproject: {name}\ncreated: {now}\nupdated: {now}\ntags: [project]\n---\n\n"
-            f"# {name}\n\n{details}\n",
-            encoding="utf-8",
-        )
-
-
-def update_facts(fact: str):
-    path = MEMORY_ROOT / "facts/facts.md"
-    date = datetime.now().strftime("%Y-%m-%d")
-    with path.open("a", encoding="utf-8") as f:
-        f.write(f"\n- [{date}] {fact}")
-
-
-def update_preferences(key: str, value: str):
-    path = MEMORY_ROOT / "preferences/preferences.md"
-    text = path.read_text(encoding="utf-8")
-    pattern = re.compile(rf"^(- \*\*{re.escape(key)}\*\*:).*$", re.MULTILINE)
-    new_line = f"- **{key}**: {value}"
-    if pattern.search(text):
-        text = pattern.sub(new_line, text)
-    else:
-        text += f"\n{new_line}"
-    path.write_text(text, encoding="utf-8")
-
-
-# ── AI Extraction (background) ────────────────────────────────────────────────
-
-def extract_and_store_async(user_msg: str, friday_reply: str):
+def log_conversation(role: str, text: str) -> None:
     """
-    Fire-and-forget: ask Groq to decide what's worth remembering,
-    then write it to the appropriate store. Runs in a daemon thread.
+    Append a conversation turn to the current session file.
+    Delegates to writer._append_turn() to keep file logic in one place.
     """
-    threading.Thread(
-        target=_extract,
-        args=(user_msg, friday_reply),
+    from memory import writer as _w
+    _w._append_turn(role, text)
+
+
+def extract_and_store_async(user_text: str, assistant_text: str) -> None:
+    """
+    Spawn a background thread to extract memorable facts from the
+    last exchange and store them in vault/facts/extracted.md.
+
+    Uses the Groq LLM with a cheap fast model to keep latency zero
+    from the user's perspective.
+    """
+    thread = threading.Thread(
+        target=_extract_worker,
+        args=(user_text, assistant_text),
         daemon=True,
-    ).start()
+    )
+    thread.start()
 
 
-def _extract(user_msg: str, friday_reply: str):
+def _extract_worker(user_text: str, assistant_text: str) -> None:
+    """Background worker — extracts facts and appends to vault/facts/extracted.md."""
     try:
+        import os
         from groq import Groq
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-        prompt = f"""You are Friday's memory extraction agent.
-Analyze this exchange and return ONLY a valid JSON object — no markdown fences.
+        client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
-USER: {user_msg}
-FRIDAY: {friday_reply}
-
-Return this shape (omit any key where there's nothing worth storing):
-{{
-  "project_updates": [{{"name": "ProjectName", "details": "what was discussed"}}],
-  "new_facts": ["concrete fact about the user"],
-  "preference_updates": [{{"key": "preference name", "value": "value"}}]
-}}
-
-Rules:
-- Only store genuinely useful, non-trivial information.
-- project_updates: only if a specific project was discussed in depth.
-- new_facts: only concrete facts (name, location, job, goals, tools used).
-- preference_updates: only if user expressed a clear preference.
-- If nothing is worth storing, return an empty object: {{}}
-"""
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",   # cheap model for extraction
-            messages=[{"role": "user", "content": prompt}],
+        prompt = (
+            "You are a memory extractor for an AI assistant called Friday.\n"
+            "Given a user message and the assistant's reply, extract any facts "
+            "worth remembering long-term: names, preferences, project details, "
+            "decisions made, or anything the user would expect Friday to recall later.\n"
+            "If there is nothing worth storing, reply with exactly: NOTHING\n"
+            "Otherwise reply with 1-4 concise bullet points, plain text, no markdown headers.\n\n"
+            f"User: {user_text}\n"
+            f"Friday: {assistant_text}"
         )
-        raw  = (resp.choices[0].message.content or "").strip()
-        raw  = re.sub(r"^```json\s*|```$", "", raw, flags=re.MULTILINE).strip()
-        data = json.loads(raw)
 
-        for proj in data.get("project_updates", []):
-            upsert_project(proj["name"], proj["details"])
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",  # cheap fast model for extraction
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+        )
 
-        for fact in data.get("new_facts", []):
-            update_facts(fact)
+        result = (response.choices[0].message.content or "").strip()
+        if result.upper() == "NOTHING" or not result:
+            return
 
-        for pref in data.get("preference_updates", []):
-            update_preferences(pref["key"], pref["value"])
+        # Append to extracted facts file
+        from memory.fact_writer import write_fact  
+        write_fact("extracted", "## Auto-extracted", result)
 
     except Exception as e:
-        print(f"[Memory/extract] {e}")
-
-
-# ── Utilities ──────────────────────────────────────────────────────────────────
-
-def _slug(name: str) -> str:
-    return re.sub(r"[^\w\-]", "_", name.lower()).strip("_")
-
-
-def _read(rel: str) -> str:
-    full = MEMORY_ROOT / rel
-    if not full.exists():
-        return ""
-    text = full.read_text(encoding="utf-8")
-    # Strip YAML frontmatter
-    return re.sub(r"^---\n.*?\n---\n", "", text, flags=re.DOTALL).strip()
-
-
-# ── Seed templates ─────────────────────────────────────────────────────────────
-
-_PREF_TEMPLATE = """\
----
-tags: [preferences]
----
-
-# User Preferences
-
-- **Language**: English
-- **Response style**: concise and direct, spoken aloud
-- **Code style**: Python, clean and well-documented
-- **Humor**: occasional, dry, not overdone
-"""
-
-_FACTS_TEMPLATE = """\
----
-tags: [facts]
----
-
-# Long-term Facts
-
-- Building a voice AI assistant called Friday
-- Stack: Groq Whisper (STT), Kokoro TTS (local), Groq LLaMA (LLM)
-- Has projects: Friday AI, ET
-"""
+        # Never crash the main thread
+        print(f"[memory extractor] warning: {e}")
