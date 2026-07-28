@@ -99,11 +99,17 @@ def _extract_worker(user_text: str, assistant_text: str) -> None:
         client = Groq(api_key=os.environ["GROQ_API_KEY"])
 
         prompt = (
-            "You are a memory extractor for an AI assistant called Friday.\n"
-            "Given a user message and the assistant's reply, extract any facts "
-            "worth remembering long-term: names, preferences, project details, "
-            "decisions made, or anything the user would expect Friday to recall later.\n"
-            "If there is nothing worth storing, reply with exactly: NOTHING\n"
+            "You are a long-term memory filter for an AI assistant called Friday.\n"
+            "Analyze the conversation below and extract ONLY facts that will still be "
+            "useful weeks or months from now.\n\n"
+            "STORE: user preferences, project locations, tech stack choices, coding conventions, "
+            "permanent decisions, frequently used workflows, personal details about the user.\n\n"
+            "NEVER STORE: command output, error messages, search results, temporary file paths, "
+            "debugging sessions, failed operations, one-time requests, anything that only "
+            "makes sense in the context of this specific conversation.\n\n"
+            "Before storing anything, ask: 'Will Boss expect Friday to remember this next month?'\n"
+            "If the answer is not a clear yes, discard it.\n\n"
+            "If nothing meets this bar, reply with exactly: NOTHING\n"
             "Otherwise reply with 1-4 concise bullet points, plain text, no markdown headers.\n\n"
             f"User: {user_text}\n"
             f"Friday: {assistant_text}"

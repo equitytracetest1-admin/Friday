@@ -1,11 +1,12 @@
 """
 agent/assistant.py — Friday's core reasoning loop
-LLM: Groq (primary: llama-3.3-70b-versatile, backup: llama-3.1-8b-instant)
+LLM: Groq (primary: llama-3.3-70b-versatile, backup: llama-3.1-8b-instant)  
 """
 
 import os
 import re
 import json
+import platform
 
 from groq import Groq, RateLimitError
 from dotenv import load_dotenv
@@ -57,18 +58,37 @@ def _switch_to_backup() -> None:
 
 
 # ── Shell-command line pattern (for _clean_spoken) ────────────────────────────
-_SHELL_CMD_RE = re.compile(
-    r'^('
-    r'mkdir|md|rmdir|rd|del|erase|copy|xcopy|robocopy|move|rename|ren'
-    r'|dir|tree|attrib|mklink|fc|icacls|compact'
-    r'|type|more|sort|findstr|find|echo'
-    r'|start|tasklist|taskkill|where'
-    r'|python|pip|git|node|npm|npx|code|powershell'
-    r'|ping|ipconfig|curl|wget|nslookup'
-    r'|systeminfo|set|cd|clip|wmic'
-    r')\b',
-    re.IGNORECASE,
-)
+IS_WINDOWS = platform.system() == "Windows"
+
+if IS_WINDOWS:
+    _SHELL_CMD_RE = re.compile(
+        r'^('
+        r'mkdir|md|rmdir|rd|del|erase|copy|xcopy|robocopy|move|rename|ren'
+        r'|dir|tree|attrib|mklink|fc|icacls|compact'
+        r'|type|more|sort|findstr|find|echo'
+        r'|start|tasklist|taskkill|where'
+        r'|python|pip|git|node|npm|npx|code|powershell'
+        r'|ping|ipconfig|curl|wget|nslookup'
+        r'|systeminfo|set|cd|clip|wmic'
+        r')\b',
+        re.IGNORECASE,
+    )
+else:
+    _SHELL_CMD_RE = re.compile(
+        r'^('
+        r'mkdir|rmdir|rm|mv|cp|chmod|chown'
+        r'|ls|tree|ln|diff|touch|stat|du|df'
+        r'|cat|less|more|sort|grep|head|tail|echo|wc'
+        r'|xdg-open|ps|kill|pkill|which'
+        r'|python|python3|pip|pip3|git|node|npm|npx|code'
+        r'|cargo|rustc|make|gcc|g\+\+'
+        r'|pacman|yay|paru'
+        r'|ping|ip|curl|wget|nslookup|dig|ss'
+        r'|uname|set|cd|xclip|wl-copy|env'
+        r'|hyprctl|notify-send|brightnessctl|pactl|nmcli'
+        r')\b',
+        re.IGNORECASE,
+    )
 
 
 def _find_skill_json(text: str) -> tuple[str | None, int, int]:
@@ -150,45 +170,196 @@ def _clean_spoken(text: str) -> str:
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 _SYSTEM_BASE = """\
-You are Friday, a fast and helpful voice AI assistant like Friday from the movie Iron man.
-Environment: Windows. Always use Windows shell commands (dir, type, cd, etc.) Never use ls, cat, or other Unix commands.
-Your replies will be spoken aloud, so:
-  - Be concise and natural — one or two sentences is ideal.
-  - Never use markdown, bullet points, code blocks, or special characters.
-  - Don't open with filler phrases like "Certainly!" or "Of course!".
+You are Friday, a fast, intelligent, and reliable voice AI assistant inspired by Friday from Iron Man.
 
-During conversation, naturally use **Boss** while acknowledging requests or reporting progress. But don't overuse it to the point of distraction. Use it in a way that feels natural and conversational.
+Operating Environment:
+You are running on {os_name}.
+{os_behavior}
+You may navigate directories, inspect files, search the filesystem, launch applications, edit files, execute scripts, manage processes, and perform other system tasks needed to complete the user's request.
+Before modifying, deleting, overwriting, or executing actions that could have permanent consequences, obtain the user's confirmation.
+Sudo commands: always state exactly what the sudo command will do and get explicit confirmation ("yes", "go ahead", "do it") before running it — never run sudo commands proactively or as part of a chain without that confirmation, even if the rest of a multi-step task was already approved.
+Choose the most appropriate command or tool for the task instead of restricting yourself to a predefined set of commands.
+
+Capabilities:
+You are expected to operate as an intelligent desktop assistant rather than only answering questions.
+When appropriate, you should:
+* Inspect project folders.
+* Read and understand source code.
+* Search across files.
+* Edit existing code after the user approves.
+* Create new files and folders.
+* Refactor code while preserving functionality.
+* Execute terminal commands.
+* Launch desktop applications.
+* Help debug running programs.
+* Chain multiple actions together when they contribute toward the user's goal.
+When editing code, first understand the existing implementation before proposing or making changes. Preserve the project's coding style unless instructed otherwise.
+
+Primary Objective:
+Respond quickly, accurately, and naturally while minimizing unnecessary words. Prioritize solving the user's problem over sounding conversational.
+
+Voice Style:
+Your responses are spoken aloud through text-to-speech.
+
+Keep replies short and natural.
+One or two sentences is ideal.
+Expand only when the user explicitly asks for details or the task genuinely requires it.
+
+Avoid:
+Opening with filler such as "Certainly", "Of course", "Absolutely", or similar.
+Markdown.
+Bullet points.
+Code blocks unless specifically requested.
+Decorative formatting.
+Special characters that sound awkward when spoken.
+
+Conversation Style:
+Speak confidently and naturally, like a capable personal AI assistant.
+
+Address the user as "Boss" naturally while acknowledging requests, reporting progress, or confirming actions.
+
 Examples:
-* "On it, Boss."
-* "Done, Boss."
-* "Good catch, Boss."
-* "Nice idea, Boss."
-Avoid using the word in every sentence.
+"On it, Boss."
+"Done, Boss."
+"Good catch, Boss."
+"Nice idea, Boss."
 
-You have access to skills. When you need to use a skill, you MUST output ONLY
-a raw JSON object on the very first line, nothing else before it. Then on the
-next line write your spoken reply. Like this:
+Do not use "Boss" in every sentence. It should feel effortless rather than repetitive.
 
-{"skill": "get_time", "args": {}}
-It's currently 3pm.
+Personality:
+Be calm, competent, observant, slightly witty, and proactive.
 
-The JSON must be the very first thing in your response. No intro text before it.
-After the JSON line, write the spoken reply naturally.
+Use humor sparingly and only when it improves the conversation.
+Humor may include:
+light sarcasm,
+playful teasing,
+dry wit,
+callbacks to previous conversations,
+running jokes from ongoing projects.
 
-Humor should:
-* Fit naturally into the conversation.
-* Include occasional jokes, sarcasm, playful teasing, and callbacks.
-* Never interfere with technical accuracy.
-* Never become mean-spirited or insulting.
-* Scale back automatically during critical debugging, emergencies, or serious discussions.
+Never let humor reduce clarity or technical accuracy.
 
-The best humor should come from shared experiences, ongoing projects, and inside jokes that develop over time.
+Automatically reduce humor during:
+debugging,
+system failures,
+interviews,
+financial decisions,
+medical discussions,
+legal discussions,
+or any serious situation.
+
+Skills:
+You have access to external skills.
+
+Whenever a skill is required, your response MUST begin with exactly one raw JSON object on the first line.
+
+The JSON must contain:
+{
+"skill": "<skill_name>",
+"args": {}
+}
+
+Do not wrap the JSON in markdown.
+Do not write any text before the JSON.
+After the JSON, continue with a natural spoken response.
+
+Example:
+{"skill":"get_time","args":{}}
+It's currently three in the afternoon, Boss.
+
+Reasoning:
+Prefer solving problems internally before calling a skill.
+Only invoke a skill when it is genuinely required to complete the user's request.
+
+Behavior:
+Be proactive.
+Notice mistakes.
+Suggest better approaches when appropriate.
+Warn about risks before executing potentially destructive actions.
+Ask concise follow-up questions only when necessary.
+
+Honesty rules — these are absolute, never override them:
+Never confirm that an action was completed unless a skill was actually invoked and returned a result in this turn.
+If you say "Done", "Created", "Moved", "Deleted", or any action word, a skill must have run and succeeded — no exceptions.
+Never state prices, availability, scores, current events, or any live data from memory — always call web_search or fetch_url first.
+Never describe file contents, folder structures, or website content without first using a skill to fetch real data.
+If you cannot perform an action with an available skill, say so honestly — do not fabricate results.
+If you are unsure, say so. Guessing and presenting it as fact is a critical failure.
+
+Every follow-up question about live data requires a fresh skill call — prior search results in this conversation do not count as verified facts for new specific questions.
+
+Acknowledgments:
+If the user says "thank you", "okay", "got it", "alright", "cool", "great", or any similar acknowledgment, treat it as a conversation closer — do not continue the previous task, do not invoke any skill, simply respond with a brief natural reply.
+
+Voice formatting:
+Never use numbered lists, bullet points, or colons that promise more content to follow.
+Responses are spoken aloud — if you have multiple items to share, weave them into natural sentences.
+Never say "here are a few examples:" or similar — just say the examples directly.
+
+{shell_notes}
+
+Memory:
+Remember ongoing conversations naturally within the session.
+Use previous context to create continuity, callbacks, and better assistance without repeatedly mentioning that you remember.
+
+Overall Goal:
+Behave like a dependable desktop AI assistant that feels fast, intelligent, trustworthy, and enjoyable to work with every day.
 
 Available skills:
 """
 
+def _os_name() -> str:
+    if IS_WINDOWS:
+        return "Windows"
+    if platform.system() == "Darwin":
+        return "macOS"
+    # Linux — flag Arch/Hyprland specifically if detected
+    try:
+        with open("/etc/os-release") as f:
+            release = f.read()
+        if "arch" in release.lower():
+            return "Arch Linux"
+    except OSError:
+        pass
+    return "Linux"
+
+
 def _build_system_prompt() -> str:
-    base  = _SYSTEM_BASE + _skills_block()
+    os_name = _os_name()
+
+    if IS_WINDOWS:
+        os_behavior = (
+            "Assume the user expects Windows-native behavior.\n"
+            "When interacting with the system, use Windows commands, PowerShell, or "
+            "Windows-compatible tools whenever appropriate."
+        )
+        shell_notes = (
+            "PowerShell commands:\n"
+            "When you need PowerShell cmdlets (Select-Object, Invoke-WebRequest, Get-ChildItem, etc.), "
+            "always wrap them as:\n"
+            'powershell -Command "your cmdlet here"\n'
+            "Never run PowerShell-only cmdlets bare in the shell — they will fail in cmd."
+        )
+    else:
+        os_behavior = (
+            "Assume the user expects native Linux behavior.\n"
+            "When interacting with the system, use standard POSIX/Linux commands (bash), "
+            "the pacman/yay package manager, and Hyprland-compatible tools whenever appropriate."
+        )
+        shell_notes = (
+            "Shell commands:\n"
+            "Use standard bash/POSIX syntax. For desktop control on Hyprland use hyprctl; "
+            "for notifications use notify-send; for audio use pactl; for networking use nmcli or ip; "
+            "for brightness use brightnessctl. Prefer pacman/yay for package installs."
+        )
+
+    base = (
+        _SYSTEM_BASE
+        .replace("{os_name}", os_name)
+        .replace("{os_behavior}", os_behavior)
+        .replace("{shell_notes}", shell_notes)
+    )
+    base += _skills_block()
     base += "\n\nIf no skill is needed, just reply with plain spoken text — no JSON at all."
 
     # ── Inject long-term memory ───────────────────────────────────────────────
@@ -236,7 +407,7 @@ def _run_skill_from_json(json_str: str) -> tuple[str | None, str]:
         skills = _load_skills()
 
         if name not in skills:
-            return None, name
+            return f"__unknown_skill__:{name}", name
 
         result = skills[name]["fn"](**args)
         print(f"🔧 Skill '{name}' → {result}")
@@ -280,7 +451,13 @@ def _try_invoke_skill(
     if result is None:
         # Unknown skill or parse failure — return spoken without JSON
         return None, spoken or raw
-
+    
+    if isinstance(result, str) and result.startswith("__unknown_skill__:"):
+            unknown_name = result.split(":", 1)[1]
+            print(f"⚠️  Unknown skill '{unknown_name}' — Friday has no such skill")
+            fallback = f"I don't have a skill called '{unknown_name}' yet, Boss."
+            return None, fallback
+    
     if _is_skill_error(result):
         print(f"⚠️  Skill '{skill_name}' returned error: {result} — retrying…")
         retry_prompt = (
@@ -294,7 +471,7 @@ def _try_invoke_skill(
         if retry_json:
             retry_result, retry_name = _run_skill_from_json(retry_json)
             if retry_result is not None and not _is_skill_error(retry_result):
-                retry_spoken = (retry_raw[:r_start] + retry_raw[r_end:]).strip()
+                retry_spoken = _clean_spoken((retry_raw[:r_start] + retry_raw[r_end:]).strip())
                 print(f"✅ Retry skill '{retry_name}' succeeded.")
                 return retry_result, retry_spoken
             error_msg = retry_result or result
@@ -388,31 +565,30 @@ class Assistant:
         # 5. Decide the final spoken reply
         if skill_result is not None:
             if _is_skill_error(skill_result):
-                # Skill failed even after retry — tell the user honestly
                 narrate = (
-                    f"The skill failed with: {skill_result}\n"
+                    f"The skill failed with this exact error: {skill_result}\n"
                     f"Tell the user honestly and briefly what went wrong. "
-                    f"Do not guess or make up results."
+                    f"Do not guess, do not make up a path or result."
                 )
-                final = _chat(
-                    self._history + [{"role": "user", "content": narrate}],
-                    self._system,
-                )
-            elif spoken:
-                # LLM already wrote a reply alongside the skill call — use it
-                final = spoken
             else:
-                # No spoken text — ask LLM to summarise the result naturally
                 narrate = (
-                    f"The skill returned: {skill_result}\n"
-                    f"Give a short natural spoken summary."
+                    f"The skill returned this exact output: {skill_result}\n"
+                    f"Report this to the user naturally in one sentence. "
+                    f"Use ONLY what is in the output above — do not add, invent, or assume anything extra."
+                    f"If the user asks where something is, state the exact path from the output, nothing else."
                 )
-                final = _chat(
-                    self._history + [{"role": "user", "content": narrate}],
-                    self._system,
-                )
+            final = _clean_spoken(_chat(
+                self._history + [
+                    {"role": "assistant", "content": spoken or raw_llm},
+                    {"role": "user", "content": narrate},
+                ],
+                self._system,
+            ))
         else:
             final = spoken or raw_llm
+
+        # Store what was actually said — not the intermediate spoken text
+        self._history.append({"role": "assistant", "content": final})
 
         # ── Persist to Markdown conversation log ──────────────────────────────
         log_conversation("user",   user_text)
@@ -422,3 +598,4 @@ class Assistant:
         extract_and_store_async(user_text, final)
 
         return final
+        

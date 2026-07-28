@@ -13,3 +13,6 @@ numpy
 
 # Env
 python-dotenv
+
+# Web search (code imports `ddgs`)
+ddgs

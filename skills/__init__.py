@@ -5,14 +5,21 @@ Add new skills by calling `register(name, description, fn)` or using the
 `@skill(name, description)` decorator from anywhere in the codebase.
 
 The agent imports `SKILLS` directly from this module.
+
+Cross-platform: works on Linux (primary) and Windows. Command whitelist,
+directory listing, and search behavior are chosen based on the running OS.
 """
 
 import os
+import platform
 import subprocess
 import datetime
 import webbrowser
 from pathlib import Path
 from typing import Callable
+
+IS_WINDOWS = platform.system() == "Windows"
+
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 
@@ -48,54 +55,146 @@ def _open_browser(url: str = "https://google.com", **_) -> str:
     return f"Opened {url}."
 
 
-# ── Whitelisted commands ───────────────────────────────────────────────────────
-_ALLOWED_COMMANDS = {
-    # File & directory ops
-    "mkdir", "md", "rmdir", "rd", "mv" "del", "erase",
+_cwd: str = os.getcwd()
+
+# ── Whitelisted commands (chosen by OS) ───────────────────────────────────────
+_ALLOWED_COMMANDS_WINDOWS = {
+    "mkdir", "md", "rmdir", "rd", "mv", "del", "erase",
     "copy", "xcopy", "robocopy", "move", "rename", "ren",
     "dir", "tree", "attrib", "mklink", "fc", "icacls", "compact",
-    # File content
     "type", "more", "sort", "findstr", "find", "echo",
-    # App & process
     "start", "tasklist", "taskkill", "where",
-    # Dev tools
     "python", "pip", "git", "node", "npm", "npx", "code", "powershell",
-    # Network
     "ping", "ipconfig", "curl", "wget", "nslookup",
-    # System / env
     "systeminfo", "set", "cd", "clip", "wmic",
+    "a:", "b:", "c:", "d:", "e:", "f:", "g:", "h:",
 }
+
+_ALLOWED_COMMANDS_LINUX = {
+    "mkdir", "rmdir", "rm", "mv", "cp", "chmod", "chown",
+    "ls", "tree", "ln", "diff", "touch", "stat", "du", "df",
+    "cat", "less", "more", "sort", "grep", "head", "tail", "echo", "wc",
+    "xdg-open", "ps", "kill", "pkill", "which",
+    "python", "python3", "pip", "pip3", "git", "node", "npm", "npx", "code",
+    "cargo", "rustc", "make", "gcc", "g++",
+    "pacman", "yay", "paru", "sudo", "systemctl", "tar", "mount", "umount", "journalctl",
+    "ping", "ip", "curl", "wget", "nslookup", "dig", "ss",
+    "uname", "set", "cd", "xclip", "wl-copy", "env",
+    "hyprctl", "notify-send", "brightnessctl", "pactl", "nmcli",
+}
+
+_ALLOWED_COMMANDS = _ALLOWED_COMMANDS_WINDOWS if IS_WINDOWS else _ALLOWED_COMMANDS_LINUX
 
 
 @skill(
     "run_command",
     (
-        "Runs a whitelisted Windows shell command and returns its output. "
-        "Covers file ops (mkdir, del, xcopy, robocopy, move, attrib, mklink, tree, fc), "
-        "content (type, findstr, find, echo, sort), "
-        "dev tools (python, pip, git, node, npm, npx, code, powershell -Command), "
-        "process control (start, tasklist, taskkill, where), "
-        "network (ping, ipconfig, curl, nslookup), "
-        "system (systeminfo, set, clip, wmic). "
-        'Args: {"cmd": "git status"}'
-    ),
+        "Runs a whitelisted shell command for the current OS ({}) and returns its output. "
+        "Use 'cd <path>' to change the working directory — tracked across calls. "
+        "On Linux this covers file ops (mkdir, rm, cp, mv, chmod), content (cat, grep, head, tail), "
+        "dev tools (python, pip, git, node, npm, make), package management (pacman, yay), "
+        "process control (ps, kill, pkill, which), network (ping, ip, curl), "
+        "system (uname, env) and Hyprland desktop tools (hyprctl, notify-send, brightnessctl, pactl, nmcli). "
+        'Args: {{"cmd": "git status"}}'
+    ).format("Windows" if IS_WINDOWS else "Linux"),
 )
 def _run_command(cmd: str = "", **_) -> str:
+    global _cwd
     if not cmd:
         return "No command provided."
 
-    base = cmd.strip().split()[0].lower()
-    if base not in _ALLOWED_COMMANDS:
+    parts = cmd.strip().split()
+    base  = parts[0].lower()
+
+    is_drive_switch = IS_WINDOWS and base.endswith(":") and len(base) == 2
+
+    if base not in _ALLOWED_COMMANDS and not is_drive_switch:
         return (
             f"Command '{base}' is not in the whitelist. "
             f"Allowed: {', '.join(sorted(_ALLOWED_COMMANDS))}"
         )
 
+    if base == "cd":
+        if len(parts) < 2:
+            return f"Current directory: {_cwd}"
+        target = " ".join(parts[1:]).strip('"').strip("'")
+        resolved = Path(target).expanduser()
+        if not resolved.is_absolute():
+            resolved = (Path(_cwd) / resolved).resolve()
+        if not resolved.exists():
+            return f"Directory not found: {resolved}"
+        if not resolved.is_dir():
+            return f"Not a directory: {resolved}"
+        _cwd = str(resolved)
+        return f"Changed directory to: {_cwd}"
+
+    if is_drive_switch:
+        drive_root = base.upper() + "\\"
+        if Path(drive_root).exists():
+            _cwd = drive_root
+            return f"Changed directory to: {_cwd}"
+        return f"Drive not found: {base}"
+
+    if base == "sudo":
+        return _run_sudo(cmd)
+
     try:
         out = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=60
+            cmd, shell=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60,
+            cwd=_cwd,
         )
         return (out.stdout or out.stderr or f"Command '{cmd}' completed successfully.").strip()
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 60 seconds."
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+def _run_sudo(cmd: str) -> str:
+    """
+    Run a sudo command. Tries passwordless sudo first (for commands whitelisted
+    in /etc/sudoers.d/). Falls back to piping SUDO_PASSWORD from .env.local via
+    stdin if passwordless fails and a password is available.
+    """
+    global _cwd
+
+    # 1. Try passwordless — safest path, no password ever touches this process
+    probe = subprocess.run(
+        ["sudo", "-n", "true"], capture_output=True, text=True,
+    )
+    if probe.returncode == 0:
+        try:
+            out = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=60, cwd=_cwd,
+            )
+            return (out.stdout or out.stderr or f"Command '{cmd}' completed successfully.").strip()
+        except subprocess.TimeoutExpired:
+            return "Command timed out after 60 seconds."
+        except Exception as exc:
+            return f"Error: {exc}"
+
+    # 2. Fall back to stored password (must be set in .env.local as SUDO_PASSWORD)
+    password = os.environ.get("SUDO_PASSWORD")
+    if not password:
+        return (
+            "This sudo command needs a password and none is configured. "
+            "Either add it to /etc/sudoers.d/friday for passwordless use, "
+            "or set SUDO_PASSWORD in .env.local."
+        )
+
+    rest = cmd[len("sudo"):].strip()
+    try:
+        out = subprocess.run(
+            f"sudo -S {rest}",
+            shell=True, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60,
+            cwd=_cwd, input=password + "\n",
+        )
+        result = (out.stdout or out.stderr or f"Command '{cmd}' completed successfully.").strip()
+        # Strip the "[sudo] password for user:" prompt echo from output
+        return result.replace(f"[sudo] password for {os.environ.get('USER', '')}: ", "").strip()
     except subprocess.TimeoutExpired:
         return "Command timed out after 60 seconds."
     except Exception as exc:
@@ -106,7 +205,7 @@ def _run_command(cmd: str = "", **_) -> str:
     "list_folder",
     (
         "Lists the contents of a folder (dirs first, then files, both sorted). "
-        'Args: {"path": "C:/Users/Goku/Desktop"} — defaults to current directory.'
+        'Args: {"path": "/home/user/Desktop"} — defaults to current directory.'
     ),
 )
 def _list_folder(path: str = ".", **_) -> str:
@@ -135,7 +234,7 @@ def _list_folder(path: str = ".", **_) -> str:
     (
         "Reads and returns a file's text content (up to 4000 chars). "
         "Use this before edit_file so you have the exact text to replace. "
-        'Args: {"path": "C:/path/to/file.py"}'
+        'Args: {"path": "/home/user/project/file.py"}'
     ),
 )
 def _read_file(path: str = "", **_) -> str:
@@ -163,7 +262,7 @@ def _read_file(path: str = "", **_) -> str:
     (
         "Creates or overwrites a file with the given content. "
         "Parent directories are created automatically. "
-        'Args: {"path": "C:/path/to/file.py", "content": "print(\'hello\')"}'
+        'Args: {"path": "/home/user/project/file.py", "content": "print(\'hello\')"}'
     ),
 )
 def _create_file(path: str = "", content: str = "", **_) -> str:
@@ -186,7 +285,7 @@ def _create_file(path: str = "", content: str = "", **_) -> str:
         "Find-and-replace text inside an existing file. "
         "Use read_file first to get the exact text, then pass it as old_text. "
         "Replaces ALL occurrences. Whitespace must match exactly. "
-        'Args: {"path": "C:/path/to/file.py", "old_text": "def foo():", "new_text": "def bar():"}'
+        'Args: {"path": "/home/user/project/file.py", "old_text": "def foo():", "new_text": "def bar():"}'
     ),
 )
 def _edit_file(path: str = "", old_text: str = "", new_text: str = "", **_) -> str:
@@ -222,7 +321,7 @@ def _edit_file(path: str = "", old_text: str = "", new_text: str = "", **_) -> s
     "append_file",
     (
         "Appends text to the end of an existing file (creates it if missing). "
-        'Args: {"path": "C:/path/to/file.py", "content": "# new section\\n"}'
+        'Args: {"path": "/home/user/project/file.py", "content": "# new section\\n"}'
     ),
 )
 def _append_file(path: str = "", content: str = "", **_) -> str:
@@ -242,3 +341,99 @@ def _append_file(path: str = "", content: str = "", **_) -> str:
         return f"Access denied: {path}"
     except Exception as e:
         return f"Failed to append to file: {e}"
+
+
+@skill(
+    "search_folder",
+    (
+        "Recursively searches a folder for any file or folder matching a name. "
+        "Use this when the user asks where something is located on their system. "
+        'Args: {"name": "knowledge", "root": "/home"} — root defaults to the home directory.'
+    ),
+)
+def _search_folder(name: str = "", root: str = "", **_) -> str:
+    if not name:
+        return "No search name provided."
+    if not root:
+        root = str(Path.home()) if not IS_WINDOWS else "E:\\"
+    try:
+        if IS_WINDOWS:
+            cmd = f'dir /s /b "{root}" 2>nul | findstr /i "{name}"'
+        else:
+            cmd = f'find "{root}" -iname "*{name}*" 2>/dev/null'
+
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=30,
+        )
+        output = result.stdout.strip()
+        if not output:
+            return f"No file or folder named '{name}' found under {root}."
+        lines = output.splitlines()
+        if len(lines) > 20:
+            lines = lines[:20]
+            lines.append("... (showing first 20 results)")
+        return "\n".join(lines)
+    except subprocess.TimeoutExpired:
+        return "Search timed out after 30 seconds."
+    except Exception as e:
+        return f"Search failed: {e}"
+
+
+@skill(
+    "fetch_url",
+    (
+        "Fetches the visible text content of a webpage so you can read and analyze it. "
+        "Always use this before describing or summarizing any website. "
+        'Args: {"url": "https://equitytrace.in"}'
+    ),
+)
+def _fetch_url(url: str = "", **_) -> str:
+    if not url:
+        return "No URL provided."
+    try:
+        import urllib.request
+        import re as _re
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        html = _re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", "", html, flags=_re.DOTALL | _re.IGNORECASE)
+        text = _re.sub(r"<[^>]+>", " ", html)
+        text = _re.sub(r"\s+", " ", text).strip()
+        if len(text) > 3000:
+            text = text[:3000] + "... (truncated)"
+        return text or "Page appears empty."
+    except Exception as e:
+        return f"Failed to fetch URL: {e}"
+
+
+@skill(
+    "web_search",
+    (
+        "Searches the web using DuckDuckGo and returns top results with titles and snippets. "
+        "Use this for any question requiring live or recent information — news, scores, "
+        "software comparisons, prices, current events, etc. No API key needed. "
+        'Args: {"query": "FIFA World Cup 2026 recent matches"}'
+    ),
+)
+def _web_search(query: str = "", **_) -> str:
+    if not query:
+        return "No search query provided."
+    try:
+        from ddgs import DDGS
+
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+
+        if not results:
+            return "No results found."
+
+        output = []
+        for i, r in enumerate(results, 1):
+            title   = r.get("title", "").strip()
+            snippet = r.get("body", "").strip()
+            output.append(f"{i}. {title}: {snippet}")
+
+        return "\n".join(output)
+
+    except Exception as e:
+        return f"Search failed: {e}"
