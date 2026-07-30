@@ -1,58 +1,33 @@
 """
 memory/memory_manager.py — High-level memory API used by assistant.py.
 
-Responsibilities:
-  - init_memory()              → ensure vault folders exist
-  - load_memory_for_prompt()   → read all fact files → return as a string block
+Phase 2 — Persistent Memory:
+  - init_memory()              → ensure vault folders exist (facts/, projects/, conversations/)
+  - load_memory_for_prompt()   → read facts/preferences/logs/projects → structured string block
   - log_conversation()         → write a turn to the session file (via writer.py)
-  - extract_and_store_async()  → background thread: ask LLM to pull facts from
-                                  the conversation and save them to vault/facts/
+  - extract_and_store_async()  → background thread: LLM classifies the last exchange into
+                                  fact / preference / project / log and stores it accordingly
 """
 
 from __future__ import annotations
 
 import os
+import json
 import threading
 from pathlib import Path
 
-VAULT_ROOT = Path(os.environ.get("FRIDAY_VAULT", "vault"))
-FACTS_DIR  = VAULT_ROOT / "facts"
-CONV_DIR   = VAULT_ROOT / "conversations"
-
-# ── writer singleton (lazy import to avoid circular deps) ─────────────────────
-_session_appender = None
+VAULT_ROOT   = Path(os.environ.get("FRIDAY_VAULT", "vault"))
+FACTS_DIR    = VAULT_ROOT / "facts"
+PROJECTS_DIR = FACTS_DIR / "projects"
+CONV_DIR     = VAULT_ROOT / "conversations"
 
 
 def init_memory() -> None:
     """Create vault directory structure on startup."""
     FACTS_DIR.mkdir(parents=True, exist_ok=True)
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     CONV_DIR.mkdir(parents=True, exist_ok=True)
     print(f"📁 Vault ready at: {VAULT_ROOT.resolve()}")
-
-
-def load_memory_for_prompt() -> str:
-    """
-    Read all .md files in vault/facts/ and return them as a single
-    string block to inject into the system prompt.
-
-    Strips YAML frontmatter so the LLM only sees clean Markdown.
-    Returns empty string if no fact files exist yet.
-    """
-    fact_files = sorted(FACTS_DIR.glob("*.md"))
-    if not fact_files:
-        return ""
-
-    blocks: list[str] = []
-    for path in fact_files:
-        try:
-            text = path.read_text(encoding="utf-8")
-            text = _strip_frontmatter(text)
-            if text.strip():
-                blocks.append(f"### {path.stem}\n{text.strip()}")
-        except OSError:
-            continue
-
-    return "\n\n".join(blocks)
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -65,23 +40,57 @@ def _strip_frontmatter(text: str) -> str:
     return text[end + 3:].lstrip("\n")
 
 
+def _read_clean(path: Path) -> str:
+    try:
+        return _strip_frontmatter(path.read_text(encoding="utf-8")).strip()
+    except OSError:
+        return ""
+
+
+def load_memory_for_prompt() -> str:
+    """
+    Read all categorized knowledge files and return a structured string block
+    to inject into the system prompt. Sections: Facts, Preferences, Logs, then
+    one subsection per project. Returns empty string if nothing exists yet.
+    """
+    from memory.fact_writer import FACTS_DIR as _FACTS_DIR, PROJECTS_DIR as _PROJ_DIR
+
+    blocks: list[str] = []
+
+    # Fixed categories first, in a stable order
+    for fname, label in (("facts.md", "Facts"), ("preferences.md", "Preferences"), ("logs.md", "Logs")):
+        path = _FACTS_DIR / fname
+        if path.exists():
+            text = _read_clean(path)
+            if text:
+                blocks.append(f"### {label}\n{text}")
+
+    # Any legacy / other top-level files (e.g. old extracted.md)
+    known = {"facts.md", "preferences.md", "logs.md"}
+    for path in sorted(_FACTS_DIR.glob("*.md")):
+        if path.name in known:
+            continue
+        text = _read_clean(path)
+        if text:
+            blocks.append(f"### {path.stem.title()}\n{text}")
+
+    # Per-project files
+    for path in sorted(_PROJ_DIR.glob("*.md")):
+        text = _read_clean(path)
+        if text:
+            blocks.append(f"### Project: {path.stem.replace('_', ' ').title()}\n{text}")
+
+    return "\n\n".join(blocks)
+
+
 def log_conversation(role: str, text: str) -> None:
-    """
-    Append a conversation turn to the current session file.
-    Delegates to writer._append_turn() to keep file logic in one place.
-    """
+    """Append a conversation turn to the current session file."""
     from memory import writer as _w
     _w._append_turn(role, text)
 
 
 def extract_and_store_async(user_text: str, assistant_text: str) -> None:
-    """
-    Spawn a background thread to extract memorable facts from the
-    last exchange and store them in vault/facts/extracted.md.
-
-    Uses the Groq LLM with a cheap fast model to keep latency zero
-    from the user's perspective.
-    """
+    """Spawn a background thread to classify and store facts from the last exchange."""
     thread = threading.Thread(
         target=_extract_worker,
         args=(user_text, assistant_text),
@@ -90,45 +99,87 @@ def extract_and_store_async(user_text: str, assistant_text: str) -> None:
     thread.start()
 
 
+_EXTRACTION_PROMPT = """\
+You are a long-term memory classifier for an AI assistant called Friday.
+
+Analyze the exchange below and decide if it contains anything worth remembering
+weeks or months from now. If the user explicitly asks Friday to remember, save,
+or tag something (e.g. "remember that...", "tag this as project X", "note that I prefer..."),
+treat that as a strong signal to store it in the category they specify or imply.
+
+Categories:
+- "fact"       → durable facts about the user, their setup, tools, or environment
+- "preference" → how the user likes things done (conventions, style, workflow choices)
+- "project"    → anything tied to a specific named project or repo (include "project" field)
+- "log"        → notable one-off events, decisions, or incidents worth a timestamped record
+
+Do NOT store: command output, error messages, search results, temporary paths,
+debugging chatter, or anything only meaningful in this specific conversation.
+
+Reply with ONLY a JSON array (no markdown, no prose). Each item:
+{"category": "fact|preference|project|log", "project": "<name or null>", "content": "<1-2 sentence summary>"}
+
+If nothing meets the bar, reply with exactly: []
+
+User: {user_text}
+Friday: {assistant_text}
+"""
+
+
 def _extract_worker(user_text: str, assistant_text: str) -> None:
-    """Background worker — extracts facts and appends to vault/facts/extracted.md."""
+    """Background worker — classifies and stores facts from the last exchange."""
     try:
-        import os
         from groq import Groq
+        from memory.fact_writer import write_category, write_project
 
         client = Groq(api_key=os.environ["GROQ_API_KEY"])
-
-        prompt = (
-            "You are a long-term memory filter for an AI assistant called Friday.\n"
-            "Analyze the conversation below and extract ONLY facts that will still be "
-            "useful weeks or months from now.\n\n"
-            "STORE: user preferences, project locations, tech stack choices, coding conventions, "
-            "permanent decisions, frequently used workflows, personal details about the user.\n\n"
-            "NEVER STORE: command output, error messages, search results, temporary file paths, "
-            "debugging sessions, failed operations, one-time requests, anything that only "
-            "makes sense in the context of this specific conversation.\n\n"
-            "Before storing anything, ask: 'Will Boss expect Friday to remember this next month?'\n"
-            "If the answer is not a clear yes, discard it.\n\n"
-            "If nothing meets this bar, reply with exactly: NOTHING\n"
-            "Otherwise reply with 1-4 concise bullet points, plain text, no markdown headers.\n\n"
-            f"User: {user_text}\n"
-            f"Friday: {assistant_text}"
-        )
+        prompt = _EXTRACTION_PROMPT.format(user_text=user_text, assistant_text=assistant_text)
 
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",  # cheap fast model for extraction
+            model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
+            max_tokens=300,
         )
 
-        result = (response.choices[0].message.content or "").strip()
-        if result.upper() == "NOTHING" or not result:
+        raw = (response.choices[0].message.content or "").strip()
+        if not raw or raw == "[]":
+            print("🧠 Extracted → nothing worth storing this turn")
             return
 
-        # Append to extracted facts file
-        from memory.fact_writer import write_fact  
-        write_fact("extracted", "## Auto-extracted", result)
+        # Strip stray markdown fences if the model adds them anyway
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw
+
+        try:
+            items = json.loads(raw)
+        except json.JSONDecodeError:
+            print(f"[memory extractor] warning: could not parse extraction output: {raw[:120]}")
+            return
+
+        if not isinstance(items, list):
+            return
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category", "")).lower().strip()
+            content  = str(item.get("content", "")).strip()
+            project  = item.get("project")
+
+            if not content:
+                continue
+
+            if category == "project" and project:
+                write_project(str(project), "## Auto-extracted", content)
+                print(f"🧠 Extracted → project '{project}': {content[:80]}")
+            elif category in ("fact", "preference", "log"):
+                write_category(category, "## Auto-extracted", content)
+                print(f"🧠 Extracted → {category}: {content[:80]}")
+            else:
+                print(f"🧠 Extracted → skipped (unknown category '{category}'): {content[:80]}")
 
     except Exception as e:
         # Never crash the main thread
         print(f"[memory extractor] warning: {e}")
+        

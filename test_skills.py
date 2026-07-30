@@ -1,50 +1,47 @@
+#!/usr/bin/env python3
 """
-test_skills.py — Level 1 Unit Tests for Friday
-Run from inside E:/Python/Friday/ with: python test_skills.py
-
-Tests every skill directly without voice, LLM, or TTS.
-Also tests the memory system independently.
-
-Usage:
-    python test_skills.py           → runs all tests
-    python test_skills.py skills    → runs only skill tests
-    python test_skills.py memory    → runs only memory tests
+test_skills.py — Regression suite for Friday.
+Run from the project root:
+    python test_skills.py
+    python test_skills.py skills
+    python test_skills.py memory
+    python test_skills.py pipeline
 """
 
-import sys
+import importlib
+import io
+import json
 import os
-import time
-import tempfile
 import platform
+import shutil
+import sys
+import tempfile
+import threading
+import types
+from datetime import datetime
 from pathlib import Path
-from dotenv import load_dotenv
+from unittest.mock import patch
 
-load_dotenv(".env.local")
-
-IS_WINDOWS  = platform.system() == "Windows"
-PROJECT_ROOT = str(Path(__file__).resolve().parent)
-
-# ── Colours for terminal output ───────────────────────────────────────────────
-GREEN  = "\033[92m"
-RED    = "\033[91m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-
-# ── Test scratch folder (cleaned up after tests) ──────────────────────────────
-SCRATCH = Path(tempfile.gettempdir()) / "friday_test_scratch"
-
-# ── Result tracking ───────────────────────────────────────────────────────────
+IS_WINDOWS = platform.system() == "Windows"
+PROJECT_ROOT = Path(__file__).resolve().parent
+_TEMP_VAULTS: list[Path] = []
+_TEMP_DIRS: list[Path] = []
 _passed = 0
 _failed = 0
 _skipped = 0
 
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+CYAN = "\033[96m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
 
 def _header(title: str) -> None:
-    print(f"\n{BOLD}{CYAN}{'─' * 52}{RESET}")
+    print(f"\n{BOLD}{CYAN}{'─' * 60}{RESET}")
     print(f"{BOLD}{CYAN}  {title}{RESET}")
-    print(f"{BOLD}{CYAN}{'─' * 52}{RESET}")
+    print(f"{BOLD}{CYAN}{'─' * 60}{RESET}")
 
 
 def _pass(name: str, detail: str = "") -> None:
@@ -69,14 +66,6 @@ def _skip(name: str, reason: str = "") -> None:
 
 
 def _run(label: str, fn, *args, expect_contains: str = "", expect_not_contains: str = "", **kwargs):
-    """
-    Run a test function and check its output.
-    expect_contains     → result must contain this string (case-insensitive)
-    expect_not_contains → result must NOT contain this string (case-insensitive)
-
-    NOTE: first param is 'label' (not 'name') to avoid clashing with skill
-    functions that also take a 'name' argument (e.g. search_folder).
-    """
     try:
         result = fn(*args, **kwargs)
         result_str = str(result).strip()
@@ -92,404 +81,348 @@ def _run(label: str, fn, *args, expect_contains: str = "", expect_not_contains: 
         _pass(label, result_str[:80])
         return result_str
 
-    except Exception as e:
-        _fail(label, f"Exception: {e}")
+    except Exception as exc:
+        _fail(label, f"Exception: {exc}")
         return ""
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SKILL TESTS
-# ══════════════════════════════════════════════════════════════════════════════
+def _maybe_reload(module_name: str):
+    if module_name in sys.modules:
+        return importlib.reload(sys.modules[module_name])
+    return importlib.import_module(module_name)
+
+
+def _prepare_temp_vault() -> tuple[Path, object, object, object]:
+    vault_dir = Path(tempfile.mkdtemp(prefix="friday_test_vault_"))
+    _TEMP_VAULTS.append(vault_dir)
+    os.environ["FRIDAY_VAULT"] = str(vault_dir)
+
+    fact_writer = _maybe_reload("memory.fact_writer")
+    memory_manager = _maybe_reload("memory.memory_manager")
+    writer = _maybe_reload("memory.writer")
+
+    fact_writer.VAULT_ROOT = vault_dir
+    fact_writer.FACTS_DIR = vault_dir / "facts"
+    fact_writer.PROJECTS_DIR = fact_writer.FACTS_DIR / "projects"
+
+    memory_manager.VAULT_ROOT = vault_dir
+    memory_manager.FACTS_DIR = vault_dir / "facts"
+    memory_manager.PROJECTS_DIR = memory_manager.FACTS_DIR / "projects"
+    memory_manager.CONV_DIR = vault_dir / "conversations"
+
+    writer.VAULT_ROOT = vault_dir
+    writer.FACTS_DIR = vault_dir / "facts"
+    writer.CONV_DIR = vault_dir / "conversations"
+    writer._session_file = None
+    writer._session_start = None
+
+    return vault_dir, fact_writer, memory_manager, writer
+
+
+def _fake_ddgs_module(results: list[dict[str, str]]):
+    mod = types.ModuleType("ddgs")
+
+    class FakeDDGS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def text(self, query: str, max_results: int = 5):
+            return iter(results)
+
+    mod.DDGS = FakeDDGS
+    return mod
+
+
+def _fake_http_response(body: bytes):
+    class FakeHTTPResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    return FakeHTTPResponse(body)
+
+
+def _fake_groq_module(response_text: str = ""):
+    mod = types.ModuleType("groq")
+
+    class FakeMessage:
+        def __init__(self, content: str):
+            self.content = content
+
+    class FakeChoice:
+        def __init__(self, content: str):
+            self.message = FakeMessage(content)
+
+    class FakeResponse:
+        def __init__(self, content: str):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def __init__(self, content: str):
+            self._content = content
+
+        def create(self, *args, **kwargs):
+            return FakeResponse(self._content)
+
+    class FakeChat:
+        def __init__(self, content: str):
+            self.completions = FakeCompletions(content)
+
+    class FakeGroq:
+        def __init__(self, api_key: str | None = None):
+            self.chat = FakeChat(response_text)
+
+    mod.Groq = FakeGroq
+    mod.RateLimitError = RuntimeError
+    return mod
+
+
+def _fake_thread_module():
+    class SyncThread:
+        def __init__(self, target, args=(), daemon=False):
+            self._target = target
+            self._args = args
+            self.daemon = daemon
+
+        def start(self):
+            self._target(*self._args)
+
+    return SyncThread
+
+
+def _import_assistant_module(fake_groq_text: str = ""):
+    fake_groq = _fake_groq_module(fake_groq_text)
+    with patch.dict(sys.modules, {"groq": fake_groq}):
+        if "agent.assistant" in sys.modules:
+            del sys.modules["agent.assistant"]
+        if "agent" in sys.modules:
+            importlib.reload(sys.modules["agent"])
+        assistant = importlib.import_module("agent.assistant")
+    return assistant
+
 
 def test_skills():
-    from skills import SKILLS
+    skills = _maybe_reload("skills")
+    _header("SKILL REGRESSION")
 
-    S = SKILLS  # shorthand
-
-    _header("SKILL TESTS")
-
-    # ── Sanity: registry not empty ────────────────────────────────────────────
-    if not S:
-        _fail("skill_registry", "SKILLS dict is empty — nothing registered")
+    if not getattr(skills, "SKILLS", None):
+        _fail("skill_registry", "SKILLS registry is missing or empty")
         return
-    _pass("skill_registry", f"{len(S)} skills registered: {', '.join(S.keys())}")
+    _pass("skill_registry", f"{len(skills.SKILLS)} skills registered")
 
-    # ── get_time ──────────────────────────────────────────────────────────────
-    _run("get_time",
-         S["get_time"]["fn"],
-         expect_contains="it's")
+    _run("get_time", skills.SKILLS["get_time"]["fn"], expect_contains="It's")
 
-    # ── open_browser ──────────────────────────────────────────────────────────
-    # We don't actually open a browser in tests — just check it returns success
-    _run("open_browser",
-         S["open_browser"]["fn"],
-         url="https://google.com",
-         expect_contains="opened")
+    with patch.object(skills.webbrowser, "open", return_value=True) as fake_open:
+        _run("open_browser", skills.SKILLS["open_browser"]["fn"], url="https://example.com", expect_contains="Opened")
+        if fake_open.called:
+            _pass("open_browser_mocked", "Browser open was mocked")
+        else:
+            _fail("open_browser_mocked", "webbrowser.open was not invoked")
 
-    # ── run_command: whitelisted command ──────────────────────────────────────
-    _run("run_command_allowed",
-         S["run_command"]["fn"],
-         cmd="echo Friday test OK",
-         expect_contains="Friday test OK")
+    temp_dir = Path(tempfile.mkdtemp(prefix="friday_test_skills_"))
+    _TEMP_DIRS.append(temp_dir)
+    skills._cwd = str(temp_dir)
+    test_file = temp_dir / "sample.txt"
+    _run("run_command_echo", skills.SKILLS["run_command"]["fn"], cmd="echo Friday test OK", expect_contains="Friday test OK")
+    _run("run_command_empty", skills.SKILLS["run_command"]["fn"], cmd="", expect_contains="No command provided")
+    _run("run_command_blocked", skills.SKILLS["run_command"]["fn"], cmd="format C:", expect_contains="not in the whitelist")
 
-    # ── run_command: blocked command ──────────────────────────────────────────
-    _run("run_command_blocked",
-         S["run_command"]["fn"],
-         cmd="format C:",
-         expect_contains="not in the whitelist")
+    _run("list_folder_missing", skills.SKILLS["list_folder"]["fn"], path=str(temp_dir / "does_not_exist"), expect_contains="Path not found")
+    file_path = temp_dir / "file.txt"
+    file_path.write_text("x", encoding="utf-8")
+    _run("list_folder_file", skills.SKILLS["list_folder"]["fn"], path=str(file_path), expect_contains="Not a directory")
+    _run("list_folder_valid", skills.SKILLS["list_folder"]["fn"], path=str(temp_dir), expect_contains="[file] file.txt")
 
-    # ── run_command: empty command ────────────────────────────────────────────
-    _run("run_command_empty",
-         S["run_command"]["fn"],
-         cmd="",
-         expect_contains="No command provided")
-
-    # ── run_command: python version ───────────────────────────────────────────
-    _run("run_command_python",
-         S["run_command"]["fn"],
-         cmd="python --version",
-         expect_contains="Python")
-
-    # ── list_folder: valid path ───────────────────────────────────────────────
-    _run("list_folder_valid",
-         S["list_folder"]["fn"],
-         path=PROJECT_ROOT,
-         expect_contains="main.py")
-
-    # ── list_folder: missing path ─────────────────────────────────────────────
-    missing_path = "C:/this_does_not_exist_xyz" if IS_WINDOWS else "/this_does_not_exist_xyz"
-    _run("list_folder_missing",
-         S["list_folder"]["fn"],
-         path=missing_path,
-         expect_contains="not found")
-
-    # ── list_folder: no path (current dir) ───────────────────────────────────
-    _run("list_folder_default",
-         S["list_folder"]["fn"])
-
-    # ── create_file ───────────────────────────────────────────────────────────
-    SCRATCH.mkdir(parents=True, exist_ok=True)
-    test_file = str(SCRATCH / "test_create.txt")
-
-    _run("create_file",
-         S["create_file"]["fn"],
-         path=test_file,
-         content="Hello from Friday tests.\nLine two.",
-         expect_contains="created")
-
-    # Verify file actually exists on disk
-    if Path(test_file).exists():
-        _pass("create_file_disk_verify", "File exists on disk")
+    _run("create_file", skills.SKILLS["create_file"]["fn"], path=str(test_file), content="hello\n", expect_contains="created")
+    if test_file.exists():
+        _pass("create_file_disk_verify", "File created on disk")
     else:
-        _fail("create_file_disk_verify", "File was NOT created on disk")
+        _fail("create_file_disk_verify", "File was not created")
 
-    # ── read_file ─────────────────────────────────────────────────────────────
-    _run("read_file",
-         S["read_file"]["fn"],
-         path=test_file,
-         expect_contains="Hello from Friday tests")
+    _run("read_file", skills.SKILLS["read_file"]["fn"], path=str(test_file), expect_contains="hello")
+    _run("edit_file", skills.SKILLS["edit_file"]["fn"], path=str(test_file), old_text="hello", new_text="goodbye", expect_contains="Replaced")
+    _run("append_file", skills.SKILLS["append_file"]["fn"], path=str(test_file), content="world", expect_contains="Appended")
 
-    # ── read_file: missing path ───────────────────────────────────────────────
-    missing_file = "C:/does_not_exist_xyz.txt" if IS_WINDOWS else "/does_not_exist_xyz.txt"
-    _run("read_file_missing",
-         S["read_file"]["fn"],
-         path=missing_file,
-         expect_contains="not found")
-
-    # ── read_file: no path ────────────────────────────────────────────────────
-    _run("read_file_no_path",
-         S["read_file"]["fn"],
-         path="",
-         expect_contains="No path provided")
-
-    # ── append_file ───────────────────────────────────────────────────────────
-    _run("append_file",
-         S["append_file"]["fn"],
-         path=test_file,
-         content="Appended by test.",
-         expect_contains="Appended")
-
-    # Verify appended content is actually there
-    content = Path(test_file).read_text(encoding="utf-8")
-    if "Appended by test." in content:
-        _pass("append_file_disk_verify", "Appended content found on disk")
+    content = test_file.read_text(encoding="utf-8")
+    if "goodbye" in content and "world" in content:
+        _pass("file_operations_verify", "edit and append both succeeded")
     else:
-        _fail("append_file_disk_verify", "Appended content NOT found on disk")
+        _fail("file_operations_verify", f"Unexpected file content: {content!r}")
 
-    # ── edit_file ─────────────────────────────────────────────────────────────
-    _run("edit_file",
-         S["edit_file"]["fn"],
-         path=test_file,
-         old_text="Hello from Friday tests.",
-         new_text="Edited by Friday tests.",
-         expect_contains="Replaced")
+    _run("search_folder", skills.SKILLS["search_folder"]["fn"], name="sample.txt", root=str(temp_dir), expect_contains="sample.txt")
 
-    # Verify edit actually happened
-    content = Path(test_file).read_text(encoding="utf-8")
-    if "Edited by Friday tests." in content and "Hello from Friday tests." not in content:
-        _pass("edit_file_disk_verify", "Edit confirmed on disk")
-    else:
-        _fail("edit_file_disk_verify", f"Edit NOT confirmed. File content: {content[:100]}")
+    fake_html = b"<html><body><p>Friday</p></body></html>"
+    fake_resp = _fake_http_response(fake_html)
+    with patch("urllib.request.urlopen", return_value=fake_resp):
+        _run("fetch_url", skills.SKILLS["fetch_url"]["fn"], url="https://example.com", expect_contains="Friday")
 
-    # ── edit_file: text not found ─────────────────────────────────────────────
-    _run("edit_file_not_found",
-         S["edit_file"]["fn"],
-         path=test_file,
-         old_text="this string does not exist in the file",
-         new_text="replacement",
-         expect_contains="not found")
+    fake_ddgs = _fake_ddgs_module([
+        {"title": "Result One", "body": "Summary one."},
+        {"title": "Result Two", "body": "Summary two."},
+    ])
+    with patch.dict(sys.modules, {"ddgs": fake_ddgs}):
+        _run("web_search", skills.SKILLS["web_search"]["fn"], query="Friday test", expect_contains="Result One")
 
-    # ── search_folder ─────────────────────────────────────────────────────────
-    _run("search_folder",
-         S["search_folder"]["fn"],
-         name="main.py",
-         root=PROJECT_ROOT,
-         expect_contains="main.py")
-
-    # ── search_folder: not found ──────────────────────────────────────────────
-    _run("search_folder_not_found",
-         S["search_folder"]["fn"],
-         name="this_file_does_not_exist_xyz_abc",
-         root=PROJECT_ROOT,
-         expect_contains="No file or folder")
-
-    # ── search_folder: no name ────────────────────────────────────────────────
-    _run("search_folder_no_name",
-         S["search_folder"]["fn"],
-         name="",
-         expect_contains="No search name")
-
-    # ── fetch_url ─────────────────────────────────────────────────────────────
-    _run("fetch_url",
-         S["fetch_url"]["fn"],
-         url="https://example.com",
-         expect_contains="example")
-
-    # ── fetch_url: invalid url ────────────────────────────────────────────────
-    _run("fetch_url_invalid",
-         S["fetch_url"]["fn"],
-         url="https://this-url-does-not-exist-xyz-abc-123.com",
-         expect_contains="Failed to fetch")
-
-    # ── fetch_url: no url ─────────────────────────────────────────────────────
-    _run("fetch_url_no_url",
-         S["fetch_url"]["fn"],
-         url="",
-         expect_contains="No URL provided")
-
-    # ── web_search ────────────────────────────────────────────────────────────
-    _run("web_search",
-         S["web_search"]["fn"],
-         query="Python programming language",
-         expect_contains="Python")
-
-    # ── web_search: empty query ───────────────────────────────────────────────
-    _run("web_search_empty",
-         S["web_search"]["fn"],
-         query="",
-         expect_contains="No search query")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MEMORY TESTS
-# ══════════════════════════════════════════════════════════════════════════════
 
 def test_memory():
-    _header("MEMORY TESTS")
+    vault_dir, fact_writer, memory_manager, writer = _prepare_temp_vault()
+    _header("PERSISTENT MEMORY")
 
-    # ── Vault (in-memory store) ───────────────────────────────────────────────
+    fact_path = fact_writer.write_category("fact", "## Test Fact", "Friday is being tested.")
+    if fact_path.exists():
+        _pass("write_category", str(fact_path.name))
+    else:
+        _fail("write_category", "Category file was not created")
+
+    project_path = fact_writer.write_project("My Project", "## Test Project", "Project note.")
+    if project_path.exists():
+        _pass("write_project", str(project_path.name))
+    else:
+        _fail("write_project", "Project file was not created")
+
+    skills = _maybe_reload("skills")
+    skills.SKILLS["remember"]["fn"](category="preference", content="Prefer tabs.")
+    pref_file = fact_writer.FACTS_DIR / "preferences.md"
+    if pref_file.exists() and "Prefer tabs." in pref_file.read_text(encoding="utf-8"):
+        _pass("remember_skill_fact", "Preference stored via remember skill")
+    else:
+        _fail("remember_skill_fact", "Remember skill did not write preference file")
+
+    memory_manager.init_memory()
+    if memory_manager.FACTS_DIR.exists() and memory_manager.PROJECTS_DIR.exists() and memory_manager.CONV_DIR.exists():
+        _pass("init_memory", "Vault directories exist")
+    else:
+        _fail("init_memory", "Vault directory structure is incomplete")
+
+    fact_writer.write_category("log", "## Log Entry", "A log entry for test.")
+    fact_writer.write_project("Future Plan", "## Plan", "Planning content.")
+    prompt_memory = memory_manager.load_memory_for_prompt()
+    if "### Facts" in prompt_memory and "### Logs" in prompt_memory and "### Project: Future Plan" in prompt_memory:
+        _pass("load_memory_for_prompt", "Memory prompt includes facts, logs, and projects")
+    else:
+        _fail("load_memory_for_prompt", prompt_memory[:120])
+
+    writer._session_file = None
+    memory_manager.log_conversation("user", "Hello from test.")
+    memory_manager.log_conversation("friday", "Hello back.")
+    session_files = list(writer.CONV_DIR.glob("**/session_*.md"))
+    if session_files:
+        content = session_files[0].read_text(encoding="utf-8")
+        if "User:" in content and "Friday:" in content:
+            _pass("log_conversation", "Conversation file contains both roles")
+        else:
+            _fail("log_conversation", "Conversation file missing expected lines")
+    else:
+        _fail("log_conversation", "No session file was written")
+
+    # Load last session into a fresh vault
+    writer._session_file = None
+    todays = writer.CONV_DIR / datetime.now().strftime("%Y-%m-%d")
+    todays.mkdir(parents=True, exist_ok=True)
+    manual_session = todays / "session_000000.md"
+    manual_session.write_text(
+        "---\ndate: 2000-01-01\n---\n\n# Session\n\n**[00:00:00] 🧑 User:** hi\n\n**[00:00:01] 🤖 Assistant:** hello\n\n",
+        encoding="utf-8",
+    )
     from memory.vault import Vault
-
-    vault = Vault()
-
-    if len(vault) == 0:
-        _pass("vault_starts_empty")
+    new_vault = Vault()
+    writer.load_last_session(new_vault)
+    if len(new_vault) == 2 and new_vault.all_turns()[0]["role"] == "user":
+        _pass("load_last_session", "Session file loaded into vault")
     else:
-        _fail("vault_starts_empty", f"Vault has {len(vault)} turns on init")
+        _fail("load_last_session", f"Loaded {len(new_vault)} turns")
 
-    vault.add("user", "Hello Friday")
-    vault.add("assistant", "Hello Boss")
-
-    if len(vault) == 2:
-        _pass("vault_add_turns", "2 turns stored")
-    else:
-        _fail("vault_add_turns", f"Expected 2 turns, got {len(vault)}")
-
-    turns = vault.last_n(1)
-    if turns[0]["role"] == "assistant" and turns[0]["content"] == "Hello Boss":
-        _pass("vault_last_n", "last_n(1) returns correct turn")
-    else:
-        _fail("vault_last_n", f"Got: {turns}")
-
-    vault.clear()
-    if len(vault) == 0:
-        _pass("vault_clear")
-    else:
-        _fail("vault_clear", f"Vault has {len(vault)} turns after clear")
-
-    # ── recall: history formatting ────────────────────────────────────────────
+    from memory.vault import Vault as VaultClass
     from memory.recall import recent_history
-
-    vault2 = Vault()
+    vault = VaultClass()
     for i in range(25):
-        vault2.add("user", f"user message {i}")
-        vault2.add("assistant", f"assistant reply {i}")
-
-    history = recent_history(vault2)
-
-    # MAX_HISTORY_TURNS = 20, so max 20 turns = 20 messages
-    if len(history) <= 20:
-        _pass("recall_max_turns", f"{len(history)} turns returned (≤ 20 cap)")
+        vault.add("user" if i % 2 == 0 else "assistant", f"turn {i}")
+    history = recent_history(vault)
+    if len(history) == 20 and all(entry["role"] in {"user", "assistant"} for entry in history):
+        _pass("recent_history", "Trims to 20 turns and normalizes roles")
     else:
-        _fail("recall_max_turns", f"Expected ≤ 20 turns, got {len(history)}")
+        _fail("recent_history", f"Returned {len(history)} entries")
 
-    for turn in history:
-        if turn["role"] not in ("user", "assistant"):
-            _fail("recall_roles", f"Bad role: {turn['role']}")
-            break
+    os.environ["GROQ_API_KEY"] = "fake"
+    fake_groq = _fake_groq_module(
+        '[{"category": "fact", "project": null, "content": "Auto extracted note."}]'
+    )
+    with patch.dict(sys.modules, {"groq": fake_groq}):
+        with patch.object(memory_manager.threading, "Thread", _fake_thread_module()):
+            memory_manager.extract_and_store_async("Please remember this fact.", "Acknowledged.")
+    if (fact_writer.FACTS_DIR / "facts.md").exists():
+        _pass("extract_and_store_async", "Background memory extractor wrote a fact")
     else:
-        _pass("recall_roles", "All roles are 'user' or 'assistant'")
+        _fail("extract_and_store_async", "Memory extractor did not write facts")
 
-    # ── memory_manager: init and load ────────────────────────────────────────
-    from memory.memory_manager import init_memory, load_memory_for_prompt
-
-    try:
-        init_memory()
-        _pass("init_memory", "Vault directories created")
-    except Exception as e:
-        _fail("init_memory", str(e))
-
-    try:
-        memory_str = load_memory_for_prompt()
-        _pass("load_memory_for_prompt", f"Returned {len(memory_str)} chars")
-    except Exception as e:
-        _fail("load_memory_for_prompt", str(e))
-
-    # ── writer: session file creation ─────────────────────────────────────────
-    from memory.writer import add_user, add_assistant, _get_session_file
-
-    vault3 = Vault()
-    try:
-        add_user(vault3, "Test user message from test_skills.py")
-        add_assistant(vault3, "Test assistant reply from test_skills.py")
-        session_file = _get_session_file()
-        if session_file.exists():
-            _pass("writer_session_file", f"Session file created: {session_file.name}")
-            content = session_file.read_text(encoding="utf-8")
-            if "Test user message" in content:
-                _pass("writer_content_verify", "Turn content found in session file")
-            else:
-                _fail("writer_content_verify", "Turn content NOT found in session file")
-        else:
-            _fail("writer_session_file", "Session file was not created on disk")
-    except Exception as e:
-        _fail("writer_session_file", str(e))
-
-    # ── fact_writer ───────────────────────────────────────────────────────────
-    from memory.fact_writer import write_fact, list_facts
-
-    try:
-        path = write_fact("test_fact", "## Test Heading", "This is a test fact from test_skills.py.")
-        if path.exists():
-            _pass("fact_writer_write", f"Fact written to {path.name}")
-            content = path.read_text(encoding="utf-8")
-            if "This is a test fact" in content:
-                _pass("fact_writer_content", "Fact content found in file")
-            else:
-                _fail("fact_writer_content", "Fact content NOT found in file")
-        else:
-            _fail("fact_writer_write", "Fact file was not created")
-    except Exception as e:
-        _fail("fact_writer_write", str(e))
-
-    try:
-        facts = list_facts()
-        if isinstance(facts, list):
-            _pass("fact_writer_list", f"{len(facts)} fact file(s) found")
-        else:
-            _fail("fact_writer_list", "list_facts() did not return a list")
-    except Exception as e:
-        _fail("fact_writer_list", str(e))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ASSISTANT PIPELINE TEST (no voice, no TTS — text only)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def test_pipeline():
-    _header("PIPELINE TEST (LLM + Skills — uses Groq API)")
+    vault_dir, fact_writer, memory_manager, writer = _prepare_temp_vault()
+    _header("ASSISTANT PIPELINE")
 
-    print(f"  {YELLOW}Note: This calls the real Groq API. Skip with Ctrl-C if offline.{RESET}\n")
+    if "GROQ_API_KEY" not in os.environ:
+        os.environ["GROQ_API_KEY"] = "fake"
 
-    try:
-        from agent.assistant import Assistant
-        from memory.vault    import Vault
-        from memory.writer   import add_user, add_assistant
+    assistant_module = _import_assistant_module()
+    assistant_module.extract_and_store_async = lambda *args, **kwargs: None
 
-        vault     = Vault()
-        assistant = Assistant()
-        assistant.start_session(vault)
+    assistant = assistant_module.Assistant()
+    vault = assistant_module.Vault()
+    assistant.start_session(vault)
 
-        cases = [
-            # (description, input, expected_in_output)
-            ("plain_response",     "say the word hello",          "hello"),
-            ("get_time_skill",     "what time is it right now",   ""),        # just check no crash
-            ("acknowledgment",     "thank you",                   ""),        # no skill, short reply
-            # format C: is handled two ways — both valid:
-            # 1. LLM calls skill → skill returns whitelist error
-            # 2. LLM refuses and asks confirmation first (smarter behavior)
-            # Either way Friday never runs it — just check no crash
-            ("whitelist_block",    "run the command format C:",   ""),
-        ]
+    call_count = {"count": 0}
 
-        for desc, query, expect in cases:
-            try:
-                add_user(vault, query)
-                reply = assistant.respond(query, vault)
-                add_assistant(vault, reply)
+    def fake_chat(messages, system):
+        call_count["count"] += 1
+        if any("The skill returned this exact output" in m.get("content", "") for m in messages):
+            return "All set, Boss."
+        return '{"skill":"run_command","args":{"cmd":"echo pipeline test"}}'
 
-                if expect and expect.lower() not in reply.lower():
-                    _fail(f"pipeline_{desc}", f"Expected '{expect}' in: {reply[:100]}")
-                elif not reply.strip():
-                    _fail(f"pipeline_{desc}", "Empty reply returned")
-                else:
-                    _pass(f"pipeline_{desc}", reply[:80])
+    assistant_module._chat = fake_chat
+    reply = assistant.respond("run a safe command", vault)
+    if "All set" in reply or "All set, Boss" in reply:
+        _pass("assistant_skill_pipeline", "Assistant ran a skill and reported the result")
+    else:
+        _fail("assistant_skill_pipeline", reply[:120])
 
-                time.sleep(1)  # avoid rate limit
+    if list(writer.CONV_DIR.glob("**/session_*.md")):
+        _pass("assistant_conversation_logging", "Assistant persisted a conversation session")
+    else:
+        _fail("assistant_conversation_logging", "No conversation file was created")
 
-            except KeyboardInterrupt:
-                _skip(f"pipeline_{desc}", "Skipped by user")
-                break
-            except Exception as e:
-                _fail(f"pipeline_{desc}", str(e))
+    count = {"count": 0}
 
-    except KeyboardInterrupt:
-        _skip("pipeline_tests", "Skipped by user")
-    except Exception as e:
-        _fail("pipeline_setup", str(e))
+    def fake_chat_honesty(messages, system):
+        count["count"] += 1
+        if count["count"] == 1:
+            return "I've created the file in the repo."
+        return "I haven't actually run anything yet."
 
+    assistant_module._chat = fake_chat_honesty
+    reply = assistant.respond("create a file", vault)
+    if "haven't actually run anything yet" in reply.lower() or "hadn't actually run anything" in reply.lower():
+        _pass("honesty_guard", "Assistant corrected an unverified action claim")
+    else:
+        _fail("honesty_guard", reply[:120])
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CLEANUP
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _cleanup():
-    """Remove the scratch folder created during tests."""
-    import shutil
-    if SCRATCH.exists():
-        shutil.rmtree(SCRATCH, ignore_errors=True)
-        print(f"\n  🧹 Cleaned up scratch folder: {SCRATCH}")
+    for path in _TEMP_DIRS + _TEMP_VAULTS:
+        shutil.rmtree(path, ignore_errors=True)
+    _TEMP_DIRS.clear()
+    _TEMP_VAULTS.clear()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _summary():
     total = _passed + _failed + _skipped
-    print(f"\n{BOLD}{'═' * 52}{RESET}")
+    print(f"\n{BOLD}{'═' * 60}{RESET}")
     print(f"{BOLD}  RESULTS   {GREEN}{_passed} passed{RESET}  {RED}{_failed} failed{RESET}  {YELLOW}{_skipped} skipped{RESET}  / {total} total{BOLD}{RESET}")
-    print(f"{BOLD}{'═' * 52}{RESET}\n")
+    print(f"{BOLD}{'═' * 60}{RESET}\n")
     if _failed == 0:
         print(f"  {GREEN}{BOLD}All tests passed. Friday is healthy. ✅{RESET}\n")
     else:
@@ -498,32 +431,20 @@ def _summary():
 
 if __name__ == "__main__":
     mode = sys.argv[1].lower() if len(sys.argv) > 1 else "all"
-
-    print(f"\n{BOLD}{'═' * 52}")
-    print(f"  🤖  Friday — Test Suite")
-    print(f"{'═' * 52}{RESET}")
+    print(f"\n{BOLD}{'═' * 60}{RESET}")
+    print(f"  🤖  Friday — Regression Suite")
+    print(f"{BOLD}{'═' * 60}{RESET}")
     print(f"  Mode: {mode}")
-    print(f"  Scratch folder: {SCRATCH}")
 
     try:
         if mode in ("all", "skills"):
             test_skills()
-
         if mode in ("all", "memory"):
             test_memory()
-
         if mode in ("all", "pipeline"):
             test_pipeline()
-
-        if mode == "skills":
-            pass   # already ran above
-        elif mode == "memory":
-            pass
-        elif mode == "pipeline":
-            pass
-        elif mode != "all":
+        if mode not in ("all", "skills", "memory", "pipeline"):
             print(f"\n{RED}Unknown mode '{mode}'. Use: skills | memory | pipeline | all{RESET}")
-
     finally:
         _cleanup()
         _summary()

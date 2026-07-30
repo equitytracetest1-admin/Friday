@@ -219,6 +219,7 @@ Speak confidently and naturally, like a capable personal AI assistant.
 Address the user as "Boss" naturally while acknowledging requests, reporting progress, or confirming actions.
 
 Examples:
+"Online, Boss."
 "On it, Boss."
 "Done, Boss."
 "Good catch, Boss."
@@ -301,6 +302,9 @@ Never say "here are a few examples:" or similar — just say the examples direct
 Memory:
 Remember ongoing conversations naturally within the session.
 Use previous context to create continuity, callbacks, and better assistance without repeatedly mentioning that you remember.
+Long-term memory is organized into four categories: facts, preferences, projects, and logs.
+If the user explicitly asks you to remember, save, note, or tag something (e.g. "remember that...", "tag this as project X", "note my preference for..."), call the 'remember' skill immediately with the right category — don't wait for background extraction.
+Most information is captured automatically in the background after each turn, so you don't need to call 'remember' for everything — only when the user explicitly signals they want something saved.
 
 Overall Goal:
 Behave like a dependable desktop AI assistant that feels fast, intelligent, trustworthy, and enjoyable to work with every day.
@@ -380,6 +384,30 @@ def _skills_block() -> str:
     if not skills:
         return "  (none registered)"
     return "\n".join(f"  - {name}: {meta['description']}" for name, meta in skills.items())
+
+
+# ── Unverified action-claim detector ──────────────────────────────────────────
+# Catches the LLM claiming it DID something (created, moved, switched branches,
+# deleted, installed, etc.) when no skill actually ran that turn. This is a
+# code-level backstop for the "never confirm actions without a skill call"
+# rule in the system prompt — instructions alone aren't reliable, especially
+# on the smaller fallback model.
+_ACTION_CLAIM_RE = re.compile(
+    r'\b('
+    r"i'?ve (just )?(created|made|moved|deleted|removed|switched|changed|installed|updated|committed|pushed|renamed|copied)"
+    r"|now,? i'?m (on|in) (the |a )?[\w./-]+"
+    r"|now (on|in) (the |a )?[\w./-]+ branch"
+    r'|(branch|file|folder|directory)\b.{0,30}?\b(was|is now|has been)\b.{0,20}?\b(created|deleted|moved|removed|switched|renamed|installed)'
+    r'|\bdone\b(?!.{0,10}\byet\b)'
+    r'|completed successfully'
+    r'|successfully (created|moved|deleted|switched|installed|updated|removed)'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def _claims_unverified_action(text: str) -> bool:
+    return bool(_ACTION_CLAIM_RE.search(text))
 
 
 # ── Skill invocation ──────────────────────────────────────────────────────────
@@ -587,6 +615,51 @@ class Assistant:
         else:
             final = spoken or raw_llm
 
+            # ── Honesty guard: no skill ran, but the reply claims an action
+            #    happened (e.g. "I've created the branch", "Now on mark3").
+            #    Instructions alone don't reliably stop smaller/fallback models
+            #    from doing this, so enforce it here in code.
+            if _claims_unverified_action(final):
+                print("⚠️  Unverified action claim detected with no skill call — forcing retry.")
+                correction = (
+                    "You just claimed an action was completed, but you did NOT call any skill "
+                    "this turn — nothing actually happened. Either output the correct skill JSON "
+                    "to actually perform the action now, or tell the user honestly that it hasn't "
+                    "been done yet and ask how to proceed. Do not claim success again without a "
+                    "skill call backing it up."
+                )
+                retry_raw = _chat(
+                    self._history + [{"role": "user", "content": correction}],
+                    self._system,
+                )
+                retry_skill_result, retry_spoken_dirty = _try_invoke_skill(
+                    retry_raw, self._history, self._system
+                )
+                retry_spoken = _clean_spoken(retry_spoken_dirty)
+
+                if retry_skill_result is not None and not _is_skill_error(retry_skill_result):
+                    final = _clean_spoken(_chat(
+                        self._history + [
+                            {"role": "assistant", "content": retry_spoken or retry_raw},
+                            {"role": "user", "content": (
+                                f"The skill returned this exact output: {retry_skill_result}\n"
+                                f"Report this to the user naturally in one sentence, using only "
+                                f"what's in the output above."
+                            )},
+                        ],
+                        self._system,
+                    ))
+                elif retry_skill_result is not None:
+                    final = f"That failed, Boss — {retry_skill_result}"
+                elif not _claims_unverified_action(retry_spoken or retry_raw):
+                    final = retry_spoken or retry_raw
+                else:
+                    # Model still won't back down — override with an honest stock reply
+                    final = (
+                        "I need to be careful here, Boss — I hadn't actually run anything for that "
+                        "yet. Want me to go ahead and do it now?"
+                    )
+
         # Store what was actually said — not the intermediate spoken text
         self._history.append({"role": "assistant", "content": final})
 
@@ -598,4 +671,4 @@ class Assistant:
         extract_and_store_async(user_text, final)
 
         return final
-        
+

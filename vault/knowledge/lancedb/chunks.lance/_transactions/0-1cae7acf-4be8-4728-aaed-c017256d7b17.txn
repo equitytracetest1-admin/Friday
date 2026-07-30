@@ -1,0 +1,3 @@
+$1cae7acf-4be8-4728-aaed-c017256d7b17²’id ÿÿÿÿÿÿÿÿÿ*string08$	parent_id ÿÿÿÿÿÿÿÿÿ*string08!source ÿÿÿÿÿÿÿÿÿ*string08!domain ÿÿÿÿÿÿÿÿÿ*string08#doc_type ÿÿÿÿÿÿÿÿÿ*string08text ÿÿÿÿÿÿÿÿÿ*string08'heading_path ÿÿÿÿÿÿÿÿÿ*string08%chunk_index ÿÿÿÿÿÿÿÿÿ*int3208%
+created_at ÿÿÿÿÿÿÿÿÿ*double08tags	 ÿÿÿÿÿÿÿÿÿ*string08"project
+ ÿÿÿÿÿÿÿÿÿ*string08'content_hash ÿÿÿÿÿÿÿÿÿ*string08&source_hash ÿÿÿÿÿÿÿÿÿ*string084vector ÿÿÿÿÿÿÿÿÿ*fixed_size_list:float:38408

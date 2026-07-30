@@ -1,5 +1,10 @@
 {
   "extraPaths": ["."],
   "pythonVersion": "3.14",
-  "typeCheckingMode": "basic"
+  "typeCheckingMode": "basic",
+  "extraPaths": ["."],
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "basic",
+  "venvPath": ".",
+  "venv": ".venv"
 }

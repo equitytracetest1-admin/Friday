@@ -14,5 +14,19 @@ numpy
 # Env
 python-dotenv
 
-# Web search (code imports `ddgs`)
-ddgs
+# Web search
+duckduckgo-search
+
+# ── Phase 2: RAG ──────────────────────────────────────────────────────────────
+# Vector database (embedded, local, no server)
+lancedb
+pyarrow
+
+# Embeddings (local, offline — no API key)
+sentence-transformers
+
+# Document ingestion
+pypdf              # PDF
+python-docx         # DOCX
+beautifulsoup4      # HTML
+pyyaml              # YAML

@@ -41,9 +41,45 @@ def skill(name: str, description: str):
 
 # ── Built-in skills ───────────────────────────────────────────────────────────
 
+@skill(
+    "remember",
+    (
+        "Explicitly saves a piece of information to Friday's long-term memory. "
+        "Use this ONLY when the user explicitly asks to remember, save, note, or tag "
+        "something (e.g. 'remember that I prefer tabs over spaces', 'tag this as project Bilt'). "
+        "category must be one of: fact, preference, project, log. "
+        "If category is 'project', include the project name in the project arg. "
+        'Args: {"category": "preference", "content": "User prefers tabs over spaces", "project": null}'
+    ),
+)
+def _remember(category: str = "", content: str = "", project: str | None = None, **_) -> str:
+    if not category:
+        return "No category provided. Must be one of: fact, preference, project, log."
+    if not content:
+        return "No content provided to remember."
+    category = category.lower().strip()
+
+    try:
+        from memory.fact_writer import write_category, write_project
+
+        if category == "project":
+            if not project:
+                return "Category is 'project' but no project name was given."
+            path = write_project(project, "## Manually tagged", content)
+            return f"Saved to project memory: {path.name}"
+        elif category in ("fact", "preference", "log"):
+            path = write_category(category, "## Manually tagged", content)
+            return f"Saved to {category} memory: {path.name}"
+        else:
+            return f"Unknown category '{category}'. Must be one of: fact, preference, project, log."
+    except Exception as e:
+        return f"Failed to save memory: {e}"
+
+
 @skill("get_time", "Returns the current local date and time. No args needed.")
 def _get_time(**_) -> str:
     return datetime.datetime.now().strftime("It's %I:%M %p on %A, %B %d, %Y.")
+
 
 
 @skill(
@@ -437,3 +473,4 @@ def _web_search(query: str = "", **_) -> str:
 
     except Exception as e:
         return f"Search failed: {e}"
+        
